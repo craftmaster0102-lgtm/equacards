@@ -136,7 +136,31 @@ app.post('/matches', async (req, res) => {
     });
   }
 });
+server.listen(PORT, () => {
+    console.log(`EquaCards Backend Running on ${PORT}`);
+});
+io.on("connection", (socket) => {
+    console.log("Player Connected:", socket.id);
 
+    socket.on("disconnect", () => {
+        console.log("Player Disconnected:", socket.id);
+    });
+});
+const http = require("http");
+const { Server } = require("socket.io");
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: [
+      "https://equacards.netlify.app",
+      "http://localhost:5500",
+      "http://127.0.0.1:5500"
+    ],
+    methods: ["GET", "POST"]
+  }
+});
 // Start server
 app.listen(PORT, () => {
   console.log(`EquaCards server running on port ${PORT}`);
