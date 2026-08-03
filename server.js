@@ -18,9 +18,15 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Middleware
 app.use(cors({
-  origin: CORS_ORIGIN,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  origin: [
+    "https://equacards.pages.dev",
+    "https://equacards.netlify.app",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500"
+  ],
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
 app.use(express.json());
 
@@ -141,11 +147,13 @@ app.post('/matches', async (req, res) => {
 const io = new Server(server, {
   cors: {
     origin: [
+      "https://equacards.pages.dev",
       "https://equacards.netlify.app",
       "http://localhost:5500",
       "http://127.0.0.1:5500"
     ],
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 const rooms = {};
