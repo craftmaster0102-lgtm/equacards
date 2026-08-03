@@ -148,13 +148,84 @@ const io = new Server(server, {
     methods: ["GET", "POST"]
   }
 });
-
+const rooms = {};
 io.on("connection", (socket) => {
+socket.on("createRoom", ({ playerName }) => {
+
+    let roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+
+    while (rooms[roomId]) {
+        roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+    }
+
+    rooms[roomId] = {
+        players: [{
+            id: socket.id,
+            name: playerName
+        }]
+    };
+
+    socket.join(roomId);
+
+    socket.emit("roomCreated", {
+        roomId
+    });
+
+    console.log("Room Created:", roomId);
+
+});
+socket.on("joinRoom", ({ roomId, playerName }) => {
+
+    roomId = roomId.toUpperCase();
+
+    if (!rooms[roomId]) {
+        socket.emit("joinError", "Room not found");
+        return;
+    }
+
+    if (rooms[roomId].players.length >= 2) {
+        socket.emit("joinError", "Room full");
+        return;
+    }
+
+    rooms[roomId].players.push({
+        id: socket.id,
+        name: playerName
+    });
+
+    socket.join(roomId);
+
+    io.to(roomId).emit("playerJoined", {
+        roomId,
+        players: rooms[roomId].players
+    });
+
+    console.log(playerName, "joined", roomId);
+
+});
+socket.on("disconnect", () => {
+
+    console.log("Disconnected:", socket.id);
+
+    for (const roomId in rooms) {
+
+        rooms[roomId].players =
+            rooms[roomId].players.filter(p => p.id !== socket.id);
+
+        if (rooms[roomId].players.length === 0) {
+
+            delete rooms[roomId];
+
+        } else {
+
+            io.to(roomId).emit("playerLeft");
+
+        }
+    }
+
+});
   console.log("Player Connected:", socket.id);
 
-  socket.on("disconnect", () => {
-    console.log("Player Disconnected:", socket.id);
-  });
 });
 
 server.listen(PORT, () => {
