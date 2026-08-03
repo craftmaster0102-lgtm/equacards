@@ -1,10 +1,12 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-
+const server = http.createServer(app);
 // Environment variables
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -136,21 +138,6 @@ app.post('/matches', async (req, res) => {
     });
   }
 });
-server.listen(PORT, () => {
-    console.log(`EquaCards Backend Running on ${PORT}`);
-});
-io.on("connection", (socket) => {
-    console.log("Player Connected:", socket.id);
-
-    socket.on("disconnect", () => {
-        console.log("Player Disconnected:", socket.id);
-    });
-});
-const http = require("http");
-const { Server } = require("socket.io");
-
-const server = http.createServer(app);
-
 const io = new Server(server, {
   cors: {
     origin: [
@@ -161,7 +148,15 @@ const io = new Server(server, {
     methods: ["GET", "POST"]
   }
 });
-// Start server
-app.listen(PORT, () => {
-  console.log(`EquaCards server running on port ${PORT}`);
+
+io.on("connection", (socket) => {
+  console.log("Player Connected:", socket.id);
+
+  socket.on("disconnect", () => {
+    console.log("Player Disconnected:", socket.id);
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`EquaCards Backend Running on ${PORT}`);
 });
