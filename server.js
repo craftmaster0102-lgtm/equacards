@@ -11,7 +11,7 @@ const server = http.createServer(app);
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
 const PORT = process.env.PORT || 3000;
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://9f4aca6c.equacards.pages.dev';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://equacards.netlify.app';
 
 // Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
@@ -19,9 +19,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 // Middleware
 app.use(cors({
   origin: [
-    "https://9f4aca6c.equacards.pages.dev",
-    "http://localhost:5500",
-    "http://127.0.0.1:5500"
+    "https://equacards.netlify.app"
   ],
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -146,9 +144,7 @@ app.post('/matches', async (req, res) => {
 const io = new Server(server, {
   cors: {
     origin: [
-      "https://9f4aca6c.equacards.pages.dev",
-      "http://localhost:5500",
-      "http://127.0.0.1:5500"
+      "https://equacards.netlify.app"
     ],
     methods: ["GET", "POST"],
     credentials: true
