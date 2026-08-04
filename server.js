@@ -90,6 +90,7 @@ app.get('/matches', async (req, res) => {
 
 // POST /scores
 app.post('/scores', async (req, res) => {
+console.log("POST /scores body:", req.body);
   try {
     const {
       username,
