@@ -91,16 +91,96 @@ app.get('/matches', async (req, res) => {
 // POST /scores
 app.post('/scores', async (req, res) => {
   try {
+    const {
+      username,
+      email,
+      score,
+      round,
+      combo,
+      correct,
+      wrong,
+      accuracy,
+      level
+    } = req.body;
+
+    if (!username) {
+      return res.status(400).json({
+        success: false,
+        error: "Username is required"
+      });
+    }
+
+    // Check existing player
+    const { data: existing, error: findError } = await supabase
+      .from("scores")
+      .select("*")
+      .eq("username", username)
+      .maybeSingle();
+
+    if (findError) throw findError;
+
+    // Player not found -> INSERT
+    if (!existing) {
+      const { data, error } = await supabase
+        .from("scores")
+        .insert([{
+          username,
+          email,
+          score,
+          round,
+          combo,
+          correct,
+          wrong,
+          accuracy,
+          level
+        }])
+        .select();
+
+      if (error) throw error;
+
+      return res.status(201).json({
+        success: true,
+        action: "insert",
+        data
+      });
+    }
+
+    // Lower or equal score -> Ignore
+    if (Number(score) <= Number(existing.score)) {
+      return res.json({
+        success: true,
+        action: "ignored",
+        message: "Score is not higher than existing best score."
+      });
+    }
+
+    // Higher score -> UPDATE
     const { data, error } = await supabase
-      .from('scores')
-      .insert([req.body])
+      .from("scores")
+      .update({
+        email,
+        score,
+        round,
+        combo,
+        correct,
+        wrong,
+        accuracy,
+        level
+      })
+      .eq("username", username)
       .select();
 
     if (error) throw error;
 
-    res.status(201).json(data);
+    return res.json({
+      success: true,
+      action: "update",
+      data
+    });
+
   } catch (err) {
-    res.status(500).json({
+    return res.status(500).json({
+      success: false,
       error: err.message
     });
   }
