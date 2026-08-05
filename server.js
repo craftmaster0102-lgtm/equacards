@@ -186,7 +186,7 @@ setInterval(() => {
       // Update DB match status
       supabase.from('matches').update({
         status: 'cancelled',
-        updated_at: new Date().toISOString()
+        : new Date().toISOString()
       }).eq('room_code', roomCode).then(({ error }) => {
         if (error) console.error(`[Supabase Error] Updating match status to cancelled for ${roomCode}:`, error);
       });
@@ -288,7 +288,7 @@ app.post('/api/users', async (req, res) => {
           username: username.trim(),
           email: email.trim(),
           last_active: now,
-          updated_at: now
+          
         },
         {
           onConflict: 'username', // Conflict on username
@@ -379,7 +379,7 @@ app.post('/api/scores', async (req, res) => {
             wrong,
             accuracy,
             level,
-            updated_at: now
+           
           })
           .eq('id', existingScoreData.id)
           .select();
@@ -390,18 +390,17 @@ app.post('/api/scores', async (req, res) => {
         resultData = data[0];
         console.log(`[API] Score for ${trimmedUsername} updated to a new high score: ${score}`);
       } else {
-        // New score is not higher, only update updated_at
+        // New score is not higher, only update 
         const { data, error } = await supabase
           .from('scores')
-          .update({ updated_at: now })
           .eq('id', existingScoreData.id)
           .select();
         if (error) {
-          console.error('[Supabase Error] Updating score (not higher, only updated_at):', error);
+          console.error('[Supabase Error] Updating score (not higher, only ):', error);
           throw error;
         }
         resultData = data[0];
-        console.log(`[API] Score for ${trimmedUsername} not updated (not higher), only updated_at.`);
+        console.log(`[API] Score for ${trimmedUsername} not updated (not higher).`);
       }
     } else {
       // Player does not exist in scores table, insert new record
@@ -419,7 +418,7 @@ app.post('/api/scores', async (req, res) => {
           accuracy,
           level,
           created_at: now,
-          updated_at: now
+          
         })
         .select();
       if (error) {
@@ -502,7 +501,7 @@ io.on('connection', (socket) => {
           host_username: trimmedUsername,
           status: 'waiting',
           created_at: now,
-          updated_at: now
+         
         })
         .select();
 
@@ -650,7 +649,7 @@ io.on('connection', (socket) => {
       // Update match status in DB (e.g., add guest username)
       await supabase.from('matches').update({
         guest_username: match.guest?.username || null,
-        updated_at: new Date().toISOString()
+         new Date().toISOString()
       }).eq('room_code', trimmedRoomCode);
 
       if (isReconnecting) {
@@ -716,7 +715,7 @@ io.on('connection', (socket) => {
           await supabase.from('matches').update({
             host_username: match.host.username,
             guest_username: null,
-            updated_at: new Date().toISOString()
+            new Date().toISOString()
           }).eq('room_code', roomCode);
         }
 
@@ -731,7 +730,7 @@ io.on('connection', (socket) => {
           // Update DB match status
           await supabase.from('matches').update({
             status: 'cancelled',
-            updated_at: new Date().toISOString()
+            new Date().toISOString()
           }).eq('room_code', roomCode);
         } else if (match.getPlayerCount() === 0) {
           console.log(`[Room Cleanup] Deleting empty room ${roomCode}.`);
@@ -739,7 +738,7 @@ io.on('connection', (socket) => {
           match.clearTimers();
           await supabase.from('matches').update({
             status: 'ended', // Or 'cancelled' depending on exact state
-            updated_at: new Date().toISOString()
+            new Date().toISOString()
           }).eq('room_code', roomCode);
         } else {
           io.to(roomCode).emit('roomUpdate', { match: match.getPlayersInfo(), status: match.status, host: match.host?.username, gameData: match.gameData, chatHistory: match.chatHistory });
@@ -785,7 +784,7 @@ io.on('connection', (socket) => {
       // Update DB
       await supabase.from('matches').update({
         status: 'cancelled',
-        updated_at: new Date().toISOString()
+       new Date().toISOString()
       }).eq('room_code', roomCode);
 
     } catch (error) {
@@ -905,7 +904,7 @@ io.on('connection', (socket) => {
       // Update DB match status
       await supabase.from('matches').update({
         status: 'playing',
-        updated_at: new Date().toISOString()
+         new Date().toISOString()
       }).eq('room_code', roomCode);
 
       console.log(`[Game Start] Room ${roomCode} game started.`);
@@ -1066,7 +1065,7 @@ io.on('connection', (socket) => {
           if (finalScore > existingScore.score) {
             await supabase.from('scores').update({
               score: finalScore,
-              updated_at: now,
+              now,
               // Update other game stats if tracked (combo, correct, wrong, accuracy, level)
               // For now, using default/placeholder values as per original prompt for these not explicitly managed by game logic
               round: match.gameData.round,
@@ -1079,7 +1078,7 @@ io.on('connection', (socket) => {
             console.log(`[Supabase] Final score for ${playerUsername} updated to new high: ${finalScore}`);
           } else {
             await supabase.from('scores').update({ updated_at: now }).eq('id', existingScore.id);
-            console.log(`[Supabase] Final score for ${playerUsername} not higher, only updated_at.`);
+            console.log(`[Supabase] Final score for ${playerUsername} not higher, only`);
           }
         } else {
           // No existing score, insert new one
@@ -1095,7 +1094,7 @@ io.on('connection', (socket) => {
             accuracy: 0.0, // Placeholder
             level: 1, // Placeholder
             created_at: now,
-            updated_at: now
+          : now
           });
           console.log(`[Supabase] New final score for ${playerUsername} inserted: ${finalScore}`);
         }
@@ -1105,7 +1104,7 @@ io.on('connection', (socket) => {
       await supabase.from('matches').update({
         status: 'ended',
         winner: winner === 'Draw' ? null : winnerUsername, // Store winner or null for draw
-        updated_at: new Date().toISOString()
+       : new Date().toISOString()
       }).eq('room_code', roomCode);
 
       io.to(roomCode).emit('matchEnded', {
@@ -1157,7 +1156,7 @@ io.on('connection', (socket) => {
       await supabase.from('matches').update({
         status: 'waiting',
         winner: null,
-        updated_at: new Date().toISOString()
+       : new Date().toISOString()
       }).eq('room_code', roomCode);
     } catch (error) {
       console.error('[Socket.IO Error] rematch:', error.message || error);
@@ -1238,7 +1237,7 @@ io.on('connection', (socket) => {
           await supabase.from('matches').update({
             host_username: match.host.username,
             guest_username: null,
-            updated_at: new Date().toISOString()
+        : new Date().toISOString()
           }).eq('room_code', roomCode);
         }
 
@@ -1250,7 +1249,7 @@ io.on('connection', (socket) => {
           io.to(roomCode).emit('matchCancelled', { message: 'Match cancelled due to host leaving or insufficient players.' });
           await supabase.from('matches').update({
             status: 'cancelled',
-            updated_at: new Date().toISOString()
+           : new Date().toISOString()
           }).eq('room_code', roomCode);
         } else if (match.getPlayerCount() === 0) {
           console.log(`[Room Cleanup] Deleting empty room ${roomCode}.`);
@@ -1258,7 +1257,7 @@ io.on('connection', (socket) => {
           match.clearTimers();
           await supabase.from('matches').update({
             status: 'ended', // Or 'cancelled' if no game started
-            updated_at: new Date().toISOString()
+         : new Date().toISOString()
           }).eq('room_code', roomCode);
         } else {
           // If match continues with remaining players, send room update
