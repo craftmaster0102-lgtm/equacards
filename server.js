@@ -42,8 +42,6 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-
 const io = new Server(httpServer, {
   cors: corsOptions,
   pingTimeout: 60000,
