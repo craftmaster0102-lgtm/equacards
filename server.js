@@ -1,1317 +1,1093 @@
-// server.js
-import 'dotenv/config';
-import express from 'express';
+ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { createClient } from '@supabase/supabase-js';
 import helmet from 'helmet';
-import cors from 'cors';
 import compression from 'compression';
+import cors from 'cors';
+import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
-import morgan from 'morgan';
-import { v4 as uuidv4 } from 'uuid';
 
-// --- Supabase Client ---
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+dotenv.config();
 
-if (!supabaseUrl || !supabaseKey) {
-  console.error('Missing SUPABASE_URL or SUPABASE_KEY in environment variables.');
-  console.error('Please ensure .env file exists and contains SUPABASE_URL and SUPABASE_KEY.');
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://equacards.netlify.app,http://localhost:5500,http://127.0.0.1:5500';
+
+if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
+  console.error(JSON.stringify({ level: 'fatal', message: 'Missing Supabase environment variables', timestamp: new Date().toISOString() }));
   process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 
-// --- Express App Setup ---
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: 'https://equacards.netlify.app', // Allow requests from your frontend
-    methods: ['GET', 'POST'],
-    credentials: true
-  }
-});
 
-const PORT = process.env.PORT || 3000;
+const whitelist = CORS_ORIGIN.split(',').map(o => o.trim()).filter(Boolean);
 
-// --- Middleware ---
-app.use(helmet()); // Secure your app by setting various HTTP headers
-app.use(compression()); // Compress response bodies for all requests
-
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per window (here, per 15 minutes)
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-  message: { success: false, error: 'Too many requests, please try again after 15 minutes.' }
-});
-
-// Apply the rate limiting middleware to all API requests (excluding Socket.IO)
-app.use('/api/', limiter);
-app.use(express.json()); // Parse JSON request bodies
-app.use(express.urlencoded({ extended: true })); // Parse URL-encoded request bodies
-app.use(morgan('combined')); // HTTP request logger
-
-// CORS for Express API endpoints (Socket.IO CORS is configured separately)
-app.use(cors({
-  origin: 'https://equacards.netlify.app',
-  credentials: true
-}));
-
-// --- In-memory Match Management ---
-const activeMatches = new Map(); // roomCode -> MatchState object
-const userSocketMap = new Map(); // username -> socket.id (for reconnection/finding active socket)
-const socketUserMap = new Map(); // socket.id -> username
-
-// Match state structure
-class MatchState {
-  constructor(roomCode, hostSocketId, hostUsername) {
-    this.roomCode = roomCode;
-    this.host = { id: hostSocketId, username: hostUsername, isReady: false };
-    this.guest = null;
-    this.status = 'waiting'; // waiting, countdown, playing, ended
-    this.players = new Map(); // Map<socketId, { username, isReady, currentScore, lastAnswerTime, ... }>
-    this.players.set(hostSocketId, { username: hostUsername, isReady: false, currentScore: 0 });
-    this.gameData = {
-      round: 0,
-      timer: 0,
-      equation: '',
-      correctAnswer: 0,
-      playersScores: {} // username -> score
-    };
-    this.gameData.playersScores[hostUsername] = 0;
-    this.heartbeats = new Map(); // socketId -> lastSeenTimestamp
-    this.heartbeats.set(hostSocketId, Date.now()); // Initialize host heartbeat
-    this.lastActivity = Date.now(); // For overall room cleanup
-    this.countdownInterval = null;
-    this.gameInterval = null;
-    this.gameRoundTimeout = null;
-    this.chatHistory = [];
-  }
-
-  getPlayerCount() {
-    return this.players.size;
-  }
-
-  getPlayersInfo() {
-    return Array.from(this.players.values()).map(p => ({
-      username: p.username,
-      isReady: p.isReady,
-      currentScore: p.currentScore
-    }));
-  }
-
-  isEveryoneReady() {
-    if (this.getPlayerCount() < 2) return false;
-    for (const player of this.players.values()) {
-      if (!player.isReady) return false;
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || whitelist.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
     }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+const io = new Server(httpServer, {
+  cors: corsOptions,
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ['websocket', 'polling'],
+  maxHttpBufferSize: 1e6
+});
+
+app.use(helmet());
+app.use(compression());
+app.use(express.json({ limit: '10kb' }));
+
+const logger = {
+  info: (msg, meta = {}) => console.log(JSON.stringify({ level: 'info', message: msg, timestamp: new Date().toISOString(), ...meta })),
+  error: (msg, meta = {}) => console.error(JSON.stringify({ level: 'error', message: msg, timestamp: new Date().toISOString(), ...meta })),
+  warn: (msg, meta = {}) => console.warn(JSON.stringify({ level: 'warn', message: msg, timestamp: new Date().toISOString(), ...meta }))
+};
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Too many requests' })
+});
+app.use(globalLimiter);
+
+const scoreLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Score submission rate limit exceeded' })
+});
+
+const roomCreateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Room creation rate limit exceeded' })
+});
+
+const sanitizeString = (str) => {
+  if (typeof str !== 'string') return '';
+  return str.trim().replace(/[<>]/g, '').slice(0, 200);
+};
+
+const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+class RoomManager {
+  constructor() {
+    this.rooms = new Map();
+    this.socketToRoom = new Map();
+    this.disconnectTimers = new Map();
+    this.DISCONNECT_TIMEOUT = 300000;
+    this.ROOM_EXPIRY = 3600000;
+    this.MAX_ROOMS = 1000;
+  }
+
+  generateRoomId() {
+    return Math.random().toString(36).substring(2, 8).toUpperCase();
+  }
+
+  createRoom(hostId) {
+    if (this.rooms.size >= this.MAX_ROOMS) {
+      throw new Error('Maximum rooms reached');
+    }
+    let roomId;
+    let attempts = 0;
+    do {
+      roomId = this.generateRoomId();
+      attempts++;
+    } while (this.rooms.has(roomId) && attempts < 100);
+    if (this.rooms.has(roomId)) throw new Error('Failed to generate unique room ID');
+
+    const room = {
+      roomId,
+      hostId,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      status: 'waiting',
+      players: new Map(),
+      scores: new Map(),
+      combos: new Map(),
+      readyState: new Map(),
+      currentRound: 0,
+      timer: null,
+      winner: null,
+      gameState: null,
+      matchStartedAt: null,
+      chat: []
+    };
+    this.rooms.set(roomId, room);
+    return room;
+  }
+
+  getRoom(roomId) {
+    return this.rooms.get(roomId) || null;
+  }
+
+  joinRoom(roomId, playerId, playerData) {
+    const room = this.rooms.get(roomId);
+    if (!room) return null;
+    if (room.players.size >= 4) return null;
+    if (room.status !== 'waiting') return null;
+
+    room.players.set(playerId, {
+      id: playerId,
+      username: sanitizeString(playerData.username || 'Anonymous'),
+      socketId: playerData.socketId,
+      connected: true,
+      joinedAt: Date.now()
+    });
+    room.scores.set(playerId, 0);
+    room.combos.set(playerId, 0);
+    room.readyState.set(playerId, false);
+    room.updatedAt = Date.now();
+    this.socketToRoom.set(playerData.socketId, roomId);
+    return room;
+  }
+
+  leaveRoom(roomId, playerId) {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+    room.players.delete(playerId);
+    room.scores.delete(playerId);
+    room.combos.delete(playerId);
+    room.readyState.delete(playerId);
+    if (room.players.size === 0) {
+      this.destroyRoom(roomId);
+    } else {
+      room.updatedAt = Date.now();
+      if (room.hostId === playerId) {
+        const nextHost = room.players.keys().next().value;
+        if (nextHost) room.hostId = nextHost;
+      }
+    }
+  }
+
+  setPlayerReady(roomId, playerId, ready) {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    room.readyState.set(playerId, ready);
+    room.updatedAt = Date.now();
     return true;
   }
 
-  resetGameData() {
-    this.gameData = {
-      round: 0,
-      timer: 0,
-      equation: '',
-      correctAnswer: 0,
-      playersScores: {}
+  startMatch(roomId) {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    room.status = 'playing';
+    room.currentRound = 1;
+    room.matchStartedAt = Date.now();
+    room.updatedAt = Date.now();
+    room.gameState = {
+      round: 1,
+      question: null,
+      answers: new Map(),
+      penalty: 0,
+      accuracy: 0,
+      startTime: Date.now()
     };
-    for (const player of this.players.values()) {
-      player.currentScore = 0;
-      player.isReady = false; // Reset readiness for rematch
-      this.gameData.playersScores[player.username] = 0;
-    }
-    this.status = 'waiting';
-    if (this.countdownInterval) {
-      clearInterval(this.countdownInterval);
-      this.countdownInterval = null;
-    }
-    if (this.gameInterval) {
-      clearInterval(this.gameInterval);
-      this.gameInterval = null;
-    }
-    if (this.gameRoundTimeout) {
-      clearTimeout(this.gameRoundTimeout);
-      this.gameRoundTimeout = null;
-    }
+    return true;
   }
 
-  // Clears all intervals and timeouts associated with this match
-  clearTimers() {
-    if (this.countdownInterval) clearInterval(this.countdownInterval);
-    if (this.gameInterval) clearInterval(this.gameInterval);
-    if (this.gameRoundTimeout) clearTimeout(this.gameRoundTimeout);
-    this.countdownInterval = null;
-    this.gameInterval = null;
-    this.gameRoundTimeout = null;
+  endMatch(roomId, winnerId) {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    room.status = 'finished';
+    room.winner = winnerId;
+    room.updatedAt = Date.now();
+    return true;
+  }
+
+  updateScore(roomId, playerId, score) {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    if (typeof score !== 'number' || score < 0 || score > 999999) return false;
+    const current = room.scores.get(playerId) || 0;
+    if (score >= current) {
+      room.scores.set(playerId, score);
+      room.updatedAt = Date.now();
+      return true;
+    }
+    return false;
+  }
+
+  updateCombo(roomId, playerId, combo) {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+    if (typeof combo !== 'number' || combo < 0) return false;
+    room.combos.set(playerId, combo);
+    return true;
+  }
+
+  handleDisconnect(socketId) {
+    const roomId = this.socketToRoom.get(socketId);
+    if (!roomId) return null;
+    const room = this.rooms.get(roomId);
+    if (!room) return null;
+
+    for (const [playerId, player] of room.players) {
+      if (player.socketId === socketId) {
+        player.connected = false;
+        const timerKey = `${roomId}:${playerId}`;
+        const existingTimer = this.disconnectTimers.get(timerKey);
+        if (existingTimer) clearTimeout(existingTimer);
+        const timer = setTimeout(() => {
+          this.destroyRoom(roomId);
+        }, this.DISCONNECT_TIMEOUT);
+        this.disconnectTimers.set(timerKey, timer);
+        return { roomId, playerId };
+      }
+    }
+    return null;
+  }
+
+  handleReconnect(roomId, playerId, socketId) {
+    const room = this.rooms.get(roomId);
+    if (!room) return null;
+    const player = room.players.get(playerId);
+    if (!player) return null;
+
+    const timerKey = `${roomId}:${playerId}`;
+    const timer = this.disconnectTimers.get(timerKey);
+    if (timer) {
+      clearTimeout(timer);
+      this.disconnectTimers.delete(timerKey);
+    }
+
+    player.socketId = socketId;
+    player.connected = true;
+    this.socketToRoom.set(socketId, roomId);
+    room.updatedAt = Date.now();
+    return room;
+  }
+
+  destroyRoom(roomId) {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+    for (const [playerId] of room.players) {
+      const timerKey = `${roomId}:${playerId}`;
+      const timer = this.disconnectTimers.get(timerKey);
+      if (timer) clearTimeout(timer);
+      this.disconnectTimers.delete(timerKey);
+    }
+    for (const [socketId, rid] of this.socketToRoom) {
+      if (rid === roomId) this.socketToRoom.delete(socketId);
+    }
+    this.rooms.delete(roomId);
+  }
+
+  cleanup() {
+    const now = Date.now();
+    const expired = [];
+    for (const [roomId, room] of this.rooms) {
+      if (room.status === 'waiting' && now - room.createdAt > this.ROOM_EXPIRY) {
+        expired.push(roomId);
+        continue;
+      }
+      if (room.players.size === 0) {
+        this.destroyRoom(roomId);
+      }
+    }
+    return expired;
+  }
+
+  getPublicRoomState(room) {
+    return {
+      roomId: room.roomId,
+      hostId: room.hostId,
+      status: room.status,
+      players: Array.from(room.players.values()).map(p => ({
+        id: p.id,
+        username: p.username,
+        connected: p.connected
+      })),
+      scores: Object.fromEntries(room.scores),
+      combos: Object.fromEntries(room.combos),
+      readyState: Object.fromEntries(room.readyState),
+      currentRound: room.currentRound,
+      timer: room.timer,
+      winner: room.winner,
+      gameState: room.gameState ? {
+        round: room.gameState.round,
+        question: room.gameState.question,
+        penalty: room.gameState.penalty,
+        accuracy: room.gameState.accuracy
+      } : null
+    };
   }
 }
 
-// Heartbeat interval to check for inactive users in matches
-setInterval(() => {
-  const now = Date.now();
-  for (const [roomCode, match] of activeMatches.entries()) {
-    // Check players' heartbeats
-    for (const [socketId, lastSeen] of match.heartbeats.entries()) {
-      if (now - lastSeen > 30 * 1000) { // 30 seconds inactivity
-        const username = socketUserMap.get(socketId);
-        console.log(`[Heartbeat] Player ${username} (${socketId}) in room ${roomCode} timed out.`);
+const roomManager = new RoomManager();
 
-        // Forcefully disconnect the timed-out socket
-        const timedOutSocket = io.sockets.sockets.get(socketId);
-        if (timedOutSocket) {
-          timedOutSocket.emit('disconnectWarning', { message: 'You have been disconnected due to inactivity.' });
-          timedOutSocket.disconnect(true); // true to close the underlying connection
-        }
-        // Disconnect handler will take care of room cleanup
-      }
-    }
+const socketRateLimits = new Map();
+io.use((socket, next) => {
+  const ip = socket.handshake.address;
+  const now = Date.now();
+  const window = 1000;
+  const max = 30;
+  const entry = socketRateLimits.get(ip) || { count: 0, reset: now + window };
+  if (now > entry.reset) {
+    entry.count = 1;
+    entry.reset = now + window;
+  } else {
+    entry.count++;
   }
-}, 15 * 1000); // Check every 15 seconds
+  socketRateLimits.set(ip, entry);
+  if (entry.count > max) {
+    return next(new Error('Rate limit exceeded'));
+  }
+  next();
+});
 
-// Global room cleanup for stale or genuinely abandoned rooms
-setInterval(() => {
-  const now = Date.now();
-  for (const [roomCode, match] of activeMatches.entries()) {
-    // If a room has been waiting for more than 5 minutes and is empty or single-player
-    if (match.status === 'waiting' && match.getPlayerCount() <= 1 && (now - match.lastActivity > 5 * 60 * 1000)) {
-      console.log(`[Room Cleanup] Deleting stale room ${roomCode} due to inactivity.`);
-      activeMatches.delete(roomCode);
-      match.clearTimers();
-      io.to(roomCode).emit('matchCancelled', { message: 'Match cancelled due to inactivity.' });
-      io.sockets.in(roomCode).socketsLeave(roomCode); // Force all sockets to leave the room
-      // Update DB match status
-      supabase.from('matches').update({
-        status: 'cancelled',
-        : new Date().toISOString()
-      }).eq('room_code', roomCode).then(({ error }) => {
-        if (error) console.error(`[Supabase Error] Updating match status to cancelled for ${roomCode}:`, error);
+io.engine.on('connection_error', (err) => {
+  logger.error('Socket connection error', { message: err.message, code: err.code });
+});
+
+io.on('connection', (socket) => {
+  logger.info('Player connected', { socketId: socket.id, ip: socket.handshake.address });
+
+  socket.on('ping', (cb) => {
+    if (typeof cb === 'function') cb({ time: Date.now() });
+  });
+
+  socket.on('heartbeat', (cb) => {
+    if (typeof cb === 'function') cb({ time: Date.now() });
+  });
+
+  socket.on('createRoom', (data, callback) => {
+    try {
+      if (typeof callback !== 'function') return;
+      const playerId = sanitizeString(data?.playerId);
+      const username = sanitizeString(data?.username);
+      if (!playerId || !username) {
+        return callback({ success: false, error: 'Invalid player data' });
+      }
+      const room = roomManager.createRoom(playerId);
+      const joined = roomManager.joinRoom(room.roomId, playerId, { username, socketId: socket.id });
+      if (!joined) {
+        roomManager.destroyRoom(room.roomId);
+        return callback({ success: false, error: 'Failed to create room' });
+      }
+      socket.join(room.roomId);
+      logger.info('Room created', { roomId: room.roomId, hostId: playerId });
+      callback({ success: true, room: roomManager.getPublicRoomState(room) });
+    } catch (err) {
+      logger.error('createRoom error', { error: err.message, socketId: socket.id });
+      if (typeof callback === 'function') callback({ success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('joinRoom', (data, callback) => {
+    try {
+      if (typeof callback !== 'function') return;
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const username = sanitizeString(data?.username);
+      if (!roomId || !playerId || !username) {
+        return callback({ success: false, error: 'Invalid data' });
+      }
+      const room = roomManager.getRoom(roomId);
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
+      }
+      if (room.status !== 'waiting') {
+        return callback({ success: false, error: 'Match already started' });
+      }
+      const joined = roomManager.joinRoom(roomId, playerId, { username, socketId: socket.id });
+      if (!joined) {
+        return callback({ success: false, error: 'Room is full or unavailable' });
+      }
+      socket.join(roomId);
+      socket.to(roomId).emit('playerJoined', { playerId, username });
+      logger.info('Player joined room', { roomId, playerId });
+      callback({ success: true, room: roomManager.getPublicRoomState(room) });
+    } catch (err) {
+      logger.error('joinRoom error', { error: err.message, socketId: socket.id });
+      if (typeof callback === 'function') callback({ success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('leaveRoom', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      if (!roomId || !playerId) return;
+      roomManager.leaveRoom(roomId, playerId);
+      socket.leave(roomId);
+      socket.to(roomId).emit('playerLeft', { playerId });
+      logger.info('Player left room', { roomId, playerId });
+    } catch (err) {
+      logger.error('leaveRoom error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('cancelRoom', (data, callback) => {
+    try {
+      if (typeof callback !== 'function') return;
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.hostId !== playerId) {
+        return callback({ success: false, error: 'Unauthorized' });
+      }
+      room.status = 'cancelled';
+      io.to(roomId).emit('roomCancelled', { roomId });
+      roomManager.destroyRoom(roomId);
+      logger.info('Room cancelled', { roomId });
+      callback({ success: true });
+    } catch (err) {
+      logger.error('cancelRoom error', { error: err.message, socketId: socket.id });
+      if (typeof callback === 'function') callback({ success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('reconnect', (data, callback) => {
+    try {
+      if (typeof callback !== 'function') return;
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      if (!roomId || !playerId) {
+        return callback({ success: false, error: 'Invalid data' });
+      }
+      const room = roomManager.handleReconnect(roomId, playerId, socket.id);
+      if (!room) {
+        return callback({ success: false, error: 'Reconnection failed' });
+      }
+      socket.join(roomId);
+      logger.info('Player reconnected', { roomId, playerId, socketId: socket.id });
+      callback({ success: true, room: roomManager.getPublicRoomState(room) });
+      io.to(roomId).emit('playerRejoined', { playerId });
+    } catch (err) {
+      logger.error('reconnect error', { error: err.message, socketId: socket.id });
+      if (typeof callback === 'function') callback({ success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('playerReady', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      if (!roomId || !playerId) return;
+      const room = roomManager.getRoom(roomId);
+      if (!room) return;
+      roomManager.setPlayerReady(roomId, playerId, true);
+      io.to(roomId).emit('playerReady', { playerId });
+      const allReady = room.players.size > 1 && Array.from(room.readyState.values()).every(r => r === true);
+      if (allReady && room.status === 'waiting') {
+        room.status = 'countdown';
+        io.to(roomId).emit('startCountdown', { countdown: 3 });
+        setTimeout(() => {
+          const started = roomManager.startMatch(roomId);
+          if (started) {
+            io.to(roomId).emit('matchStarted', { room: roomManager.getPublicRoomState(room) });
+            logger.info('Match started', { roomId });
+          }
+        }, 3000);
+      }
+    } catch (err) {
+      logger.error('playerReady error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('playerNotReady', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      if (!roomId || !playerId) return;
+      roomManager.setPlayerReady(roomId, playerId, false);
+      socket.to(roomId).emit('playerNotReady', { playerId });
+    } catch (err) {
+      logger.error('playerNotReady error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('submitMove', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const move = data?.move;
+      if (!roomId || !playerId || move === undefined) return;
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.status !== 'playing') return;
+      socket.to(roomId).emit('moveSubmitted', { playerId, move });
+    } catch (err) {
+      logger.error('submitMove error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('submitAnswer', (data, callback) => {
+    try {
+      if (typeof callback !== 'function') return;
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const answer = data?.answer;
+      const timeTaken = data?.timeTaken;
+      if (!roomId || !playerId || answer === undefined) {
+        return callback({ success: false, error: 'Invalid data' });
+      }
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.status !== 'playing') {
+        return callback({ success: false, error: 'Match not active' });
+      }
+
+      let isCorrect = false;
+      if (room.gameState && room.gameState.question && room.gameState.question.answer !== undefined) {
+        isCorrect = String(answer).trim().toLowerCase() === String(room.gameState.question.answer).trim().toLowerCase();
+      }
+
+      const baseScore = isCorrect ? 100 : 0;
+      const timeBonus = isCorrect ? Math.max(0, Math.floor(50 - (timeTaken || 0) / 200)) : 0;
+      const scoreDelta = baseScore + timeBonus;
+      const currentScore = room.scores.get(playerId) || 0;
+      const newScore = currentScore + scoreDelta;
+
+      roomManager.updateScore(roomId, playerId, newScore);
+      if (isCorrect) {
+        const currentCombo = room.combos.get(playerId) || 0;
+        roomManager.updateCombo(roomId, playerId, currentCombo + 1);
+      } else {
+        roomManager.updateCombo(roomId, playerId, 0);
+      }
+
+      callback({ success: true, correct: isCorrect, score: newScore, scoreDelta });
+      io.to(roomId).emit('answerResult', { playerId, correct: isCorrect, score: newScore, scoreDelta });
+      io.to(roomId).emit('scoreUpdate', { scores: Object.fromEntries(room.scores), combos: Object.fromEntries(room.combos) });
+    } catch (err) {
+      logger.error('submitAnswer error', { error: err.message, socketId: socket.id });
+      if (typeof callback === 'function') callback({ success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('scoreUpdate', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const score = data?.score;
+      if (!roomId || !playerId || typeof score !== 'number') return;
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.status !== 'playing') return;
+      const current = room.scores.get(playerId) || 0;
+      if (score >= current && score <= current + 1000) {
+        roomManager.updateScore(roomId, playerId, score);
+        io.to(roomId).emit('scoreUpdate', { scores: Object.fromEntries(room.scores), combos: Object.fromEntries(room.combos) });
+      }
+    } catch (err) {
+      logger.error('scoreUpdate error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('timerUpdate', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const timeLeft = data?.timeLeft;
+      if (!roomId || typeof timeLeft !== 'number') return;
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.status !== 'playing') return;
+      room.timer = timeLeft;
+      socket.to(roomId).emit('timerUpdate', { timeLeft });
+    } catch (err) {
+      logger.error('timerUpdate error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('roundUpdate', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const round = data?.round;
+      if (!roomId || typeof round !== 'number' || round < 1) return;
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.status !== 'playing') return;
+      room.currentRound = round;
+      if (room.gameState) room.gameState.round = round;
+      room.updatedAt = Date.now();
+      io.to(roomId).emit('roundUpdate', { round });
+    } catch (err) {
+      logger.error('roundUpdate error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('syncGameState', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const gameState = data?.gameState;
+      if (!roomId || !playerId || !gameState) return;
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.status !== 'playing') return;
+
+      if (gameState.round && typeof gameState.round === 'number') {
+        room.currentRound = gameState.round;
+      }
+      if (gameState.question) {
+        if (!room.gameState) room.gameState = {};
+        room.gameState.question = gameState.question;
+      }
+      if (typeof gameState.penalty === 'number') {
+        if (!room.gameState) room.gameState = {};
+        room.gameState.penalty = gameState.penalty;
+      }
+      if (typeof gameState.accuracy === 'number') {
+        if (!room.gameState) room.gameState = {};
+        room.gameState.accuracy = gameState.accuracy;
+      }
+      room.updatedAt = Date.now();
+
+      io.to(roomId).emit('gameStateSync', {
+        round: room.currentRound,
+        question: room.gameState ? room.gameState.question : null,
+        penalty: room.gameState ? room.gameState.penalty : 0,
+        accuracy: room.gameState ? room.gameState.accuracy : 0,
+        scores: Object.fromEntries(room.scores),
+        combos: Object.fromEntries(room.combos)
       });
+    } catch (err) {
+      logger.error('syncGameState error', { error: err.message, socketId: socket.id });
     }
-  }
-}, 60 * 1000); // Check every minute
+  });
 
-// --- Helper Functions ---
-const generateRoomCode = () => {
-  let code;
-  do {
-    // Generate a 6 character alphanumeric code
-    code = Math.random().toString(36).substring(2, 8).toUpperCase();
-  } while (activeMatches.has(code)); // Ensure uniqueness
-  return code;
-};
-
-// Function to generate a simple math equation
-const generateEquation = (level = 1) => {
-  let num1, num2, operator, result;
-  const operators = ['+', '-', '*']; // Division removed for simplicity to ensure integer results
-  const maxNum = Math.min(20 + level * 5, 100); // Max number increases with level, capped at 100
-
-  do {
-    num1 = Math.floor(Math.random() * maxNum) + 1;
-    num2 = Math.floor(Math.random() * maxNum) + 1;
-    operator = operators[Math.floor(Math.random() * operators.length)];
-
-    switch (operator) {
-      case '+':
-        result = num1 + num2;
-        break;
-      case '-':
-        result = num1 - num2;
-        break;
-      case '*':
-        result = num1 * num2;
-        break;
-      default:
-        result = 0; // Should not happen
-    }
-  } while (result < 0 || result > 200); // Ensure results are within a reasonable range
-
-  return { equation: `${num1} ${operator} ${num2}`, correctAnswer: result };
-};
-
-
-// --- API Endpoints ---
-// All API endpoints are prefixed with '/api' to avoid conflict with root health check
-// Health Check
-app.get('/', (req, res) => {
-  try {
-    console.log('[API] Health check requested');
-    res.status(200).json({ success: true, message: 'Server is healthy' });
-  } catch (error) {
-    console.error('[API Error] Health check:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// Leaderboard
-app.get('/api/leaderboard', async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit, 10) || 10;
-    console.log(`[API] Leaderboard requested with limit: ${limit}`);
-
-    // Assuming a Supabase function 'get_leaderboard' exists as defined in the prompt.
-    // This function should return 'username' and 'highest_score'.
-    const { data, error } = await supabase
-      .rpc('get_leaderboard', { limit_val: limit });
-
-    if (error) {
-      console.error('[Supabase Error] Leaderboard fetch:', error);
-      throw error;
-    }
-
-    res.status(200).json({ success: true, data });
-  } catch (error) {
-    console.error('[API Error] Leaderboard:', error.message || error);
-    res.status(500).json({ success: false, error: error.message || 'Failed to retrieve leaderboard.' });
-  }
-});
-
-// Users - Create/Update User (Upsert)
-app.post('/api/users', async (req, res) => {
-  try {
-    const { username, email } = req.body;
-
-    if (!username || !email) {
-      return res.status(400).json({ success: false, error: 'Username and email are required.' });
-    }
-
-    const now = new Date().toISOString();
-
-    const { data, error } = await supabase
-      .from('users')
-      .upsert(
-        {
-          username: username.trim(),
-          email: email.trim(),
-          last_active: now,
-          
-        },
-        {
-          onConflict: 'username', // Conflict on username
-          ignoreDuplicates: false // Ensure update happens on conflict
-        }
-      )
-      .select(); // Return the upserted record
-
-    if (error) {
-      // Supabase typically handles 'onConflict' gracefully, but explicit duplicate handling can be useful
-      if (error.code === '23505') { // PostgreSQL unique_violation for cases where onConflict might not be fully applied as expected (e.g., if multiple unique constraints)
-        console.warn(`[Supabase Warning] Duplicate username constraint violated for ${username}.`);
-        return res.status(409).json({ success: false, error: 'Username already exists and cannot be duplicated.' });
+  socket.on('requestResync', (data, callback) => {
+    try {
+      if (typeof callback !== 'function') return;
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const room = roomManager.getRoom(roomId);
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
       }
-      console.error('[Supabase Error] User upsert:', error);
-      throw error;
+      callback({
+        success: true,
+        room: roomManager.getPublicRoomState(room)
+      });
+    } catch (err) {
+      logger.error('requestResync error', { error: err.message, socketId: socket.id });
+      if (typeof callback === 'function') callback({ success: false, error: 'Server error' });
     }
+  });
 
-    console.log(`[API] User ${username} upserted successfully.`);
-    res.status(200).json({ success: true, data: data[0] });
-  } catch (error) {
-    console.error('[API Error] User upsert:', error.message || error);
-    res.status(500).json({ success: false, error: error.message || 'Failed to upsert user.' });
-  }
+  socket.on('matchEnded', async (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const winnerId = sanitizeString(data?.winnerId);
+      if (!roomId) return;
+      const room = roomManager.getRoom(roomId);
+      if (!room) return;
+
+      roomManager.endMatch(roomId, winnerId);
+
+      let highestScore = 0;
+      for (const score of room.scores.values()) {
+        if (score > highestScore) highestScore = score;
+      }
+
+      const duration = room.matchStartedAt ? Math.floor((Date.now() - room.matchStartedAt) / 1000) : 0;
+      const players = Array.from(room.players.values()).map(p => ({
+        id: p.id,
+        username: p.username,
+        score: room.scores.get(p.id) || 0
+      }));
+
+      const { error } = await supabase.from('matches').insert({
+        room_id: roomId,
+        players,
+        winner: winnerId || null,
+        duration,
+        highest_score: highestScore,
+        status: 'completed',
+        created_at: new Date(room.createdAt).toISOString(),
+        finished_at: new Date().toISOString()
+      });
+
+      if (error) {
+        logger.error('Failed to save match', { error: error.message, roomId });
+      } else {
+        logger.info('Match saved', { roomId, winner: winnerId, duration });
+      }
+
+      io.to(roomId).emit('matchEnded', {
+        room: roomManager.getPublicRoomState(room),
+        winner: winnerId,
+        duration
+      });
+    } catch (err) {
+      logger.error('matchEnded error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('rematch', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.hostId !== playerId) return;
+      room.status = 'waiting';
+      room.currentRound = 0;
+      room.winner = null;
+      room.gameState = null;
+      room.matchStartedAt = null;
+      room.timer = null;
+      room.scores.clear();
+      room.combos.clear();
+      room.readyState.clear();
+      for (const player of room.players.values()) {
+        room.scores.set(player.id, 0);
+        room.combos.set(player.id, 0);
+        room.readyState.set(player.id, false);
+      }
+      room.updatedAt = Date.now();
+      io.to(roomId).emit('rematchStarted', { room: roomManager.getPublicRoomState(room) });
+      logger.info('Rematch started', { roomId });
+    } catch (err) {
+      logger.error('rematch error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('chatMessage', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const message = sanitizeString(data?.message);
+      if (!roomId || !playerId || !message) return;
+      const room = roomManager.getRoom(roomId);
+      if (!room) return;
+      const player = room.players.get(playerId);
+      if (!player) return;
+      const chatData = {
+        playerId,
+        username: player.username,
+        message,
+        timestamp: Date.now()
+      };
+      room.chat.push(chatData);
+      if (room.chat.length > 100) room.chat.shift();
+      io.to(roomId).emit('chatMessage', chatData);
+    } catch (err) {
+      logger.error('chatMessage error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('typing', (data) => {
+    try {
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const playerId = sanitizeString(data?.playerId);
+      const isTyping = !!data?.isTyping;
+      if (!roomId || !playerId) return;
+      socket.to(roomId).emit('playerTyping', { playerId, isTyping });
+    } catch (err) {
+      logger.error('typing error', { error: err.message, socketId: socket.id });
+    }
+  });
+
+  socket.on('spectatorJoin', (data, callback) => {
+    try {
+      if (typeof callback !== 'function') return;
+      const roomId = sanitizeString(data?.roomId)?.toUpperCase();
+      const room = roomManager.getRoom(roomId);
+      if (!room) {
+        return callback({ success: false, error: 'Room not found' });
+      }
+      socket.join(roomId);
+      callback({ success: true, room: roomManager.getPublicRoomState(room) });
+    } catch (err) {
+      logger.error('spectatorJoin error', { error: err.message, socketId: socket.id });
+      if (typeof callback === 'function') callback({ success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('disconnect', (reason) => {
+    logger.info('Player disconnected', { socketId: socket.id, reason });
+    const dcInfo = roomManager.handleDisconnect(socket.id);
+    if (dcInfo) {
+      const room = roomManager.getRoom(dcInfo.roomId);
+      if (room) {
+        io.to(dcInfo.roomId).emit('playerDisconnected', { playerId: dcInfo.playerId });
+      }
+    }
+    roomManager.socketToRoom.delete(socket.id);
+  });
 });
 
-// Users - Get All Users
-app.get('/api/users', async (req, res) => {
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    logger.info('API request', {
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duration,
+      ip: req.ip
+    });
+  });
+  next();
+});
+
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'equacards-backend', timestamp: new Date().toISOString() });
+});
+
+app.get('/leaderboard', async (req, res, next) => {
   try {
-    console.log('[API] Get all users requested');
     const { data, error } = await supabase
-      .from('users')
-      .select('*');
-
-    if (error) {
-      console.error('[Supabase Error] Get all users:', error);
-      throw error;
-    }
-
-    res.status(200).json({ success: true, data });
-  } catch (error) {
-    console.error('[API Error] Get all users:', error.message || error);
-    res.status(500).json({ success: false, error: error.message || 'Failed to retrieve users.' });
+      .from('scores')
+      .select('*')
+      .order('score', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    next(err);
   }
 });
 
-// Scores - Post New Score or Update Highest Score
-app.post('/api/scores', async (req, res) => {
+app.get('/users', async (req, res, next) => {
   try {
-    const { username, email, score, round, combo, correct, wrong, accuracy, level } = req.body;
+    const { data, error } = await supabase.from('users').select('*');
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    next(err);
+  }
+});
 
-    // Basic validation
-    if (!username || !email || score === undefined || round === undefined || combo === undefined ||
-      correct === undefined || wrong === undefined || accuracy === undefined || level === undefined) {
-      return res.status(400).json({ success: false, error: 'All score fields (username, email, score, round, combo, correct, wrong, accuracy, level) are required.' });
+app.get('/matches', async (req, res, next) => {
+  try {
+    const { data, error } = await supabase
+      .from('matches')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function saveScoreLogic(username, score, email) {
+  username = sanitizeString(username);
+  if (!username) throw new Error('Username is required');
+  if (typeof score !== 'number' || isNaN(score)) throw new Error('Score must be a number');
+  if (score < 0) throw new Error('Score cannot be negative');
+  if (score > 999999) throw new Error('Score exceeds maximum allowed');
+
+  const { data: existing, error: fetchError } = await supabase
+    .from('scores')
+    .select('id, score')
+    .eq('username', username)
+    .single();
+
+  if (fetchError && fetchError.code !== 'PGRST116') throw fetchError;
+
+  if (existing) {
+    if (score > existing.score) {
+      const { error } = await supabase
+        .from('scores')
+        .update({ score, updated_at: new Date().toISOString() })
+        .eq('id', existing.id);
+      if (error) throw error;
+      return { updated: true, username, score, previousScore: existing.score };
+    }
+    return { updated: false, username, score: existing.score, message: 'Existing score is higher or equal' };
+  }
+
+  const { error } = await supabase
+    .from('scores')
+    .insert({
+      username,
+      score,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    });
+  if (error) throw error;
+  return { created: true, username, score };
+}
+
+app.post('/scores', scoreLimiter, async (req, res, next) => {
+  try {
+    const { username, score, email } = req.body || {};
+    const result = await saveScoreLogic(username, score, email);
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/save-score', scoreLimiter, async (req, res, next) => {
+  try {
+    const { username, score, email } = req.body || {};
+    const result = await saveScoreLogic(username, score, email);
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/saveScore', scoreLimiter, async (req, res, next) => {
+  try {
+    const { username, score, email } = req.body || {};
+    const result = await saveScoreLogic(username, score, email);
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/users', async (req, res, next) => {
+  try {
+    const { username, email } = req.body || {};
+    const cleanUsername = sanitizeString(username);
+    const cleanEmail = sanitizeString(email);
+
+    if (!cleanUsername) return res.status(400).json({ error: 'Username is required' });
+    if (cleanUsername.length < 2 || cleanUsername.length > 30) {
+      return res.status(400).json({ error: 'Username must be 2-30 characters' });
+    }
+    if (cleanEmail && !isValidEmail(cleanEmail)) {
+      return res.status(400).json({ error: 'Invalid email format' });
     }
 
-    const now = new Date().toISOString();
-    const trimmedUsername = username.trim();
-    const trimmedEmail = email.trim();
-
-    // First, check if a score for this username already exists.
-    // This assumes `scores` table holds a single best score per user.
-    const { data: existingScoreData, error: fetchError } = await supabase
-      .from('scores')
-      .select('id, score')
-      .eq('username', trimmedUsername)
+    const { data: existing, error: fetchError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('username', cleanUsername)
       .single();
 
-    if (fetchError && fetchError.code !== 'PGRST116') { // PGRST116 means 'no rows found'
-      console.error('[Supabase Error] Fetching existing score:', fetchError);
-      throw fetchError;
-    }
+    if (fetchError && fetchError.code !== 'PGRST116') throw fetchError;
 
-    let resultData;
-    if (existingScoreData) {
-      // Player exists in scores table
-      if (score > existingScoreData.score) {
-        // New score is higher, update all score-related fields
-        const { data, error } = await supabase
-          .from('scores')
-          .update({
-            email: trimmedEmail,
-            score,
-            round,
-            combo,
-            correct,
-            wrong,
-            accuracy,
-            level,
-           
-          })
-          .eq('id', existingScoreData.id)
-          .select();
-        if (error) {
-          console.error('[Supabase Error] Updating score (higher):', error);
-          throw error;
-        }
-        resultData = data[0];
-        console.log(`[API] Score for ${trimmedUsername} updated to a new high score: ${score}`);
-      } else {
-        // New score is not higher, only update 
-        const { data, error } = await supabase
-          .from('scores')
-          .eq('id', existingScoreData.id)
-          .select();
-        if (error) {
-          console.error('[Supabase Error] Updating score (not higher, only ):', error);
-          throw error;
-        }
-        resultData = data[0];
-        console.log(`[API] Score for ${trimmedUsername} not updated (not higher).`);
-      }
-    } else {
-      // Player does not exist in scores table, insert new record
-      const { data, error } = await supabase
-        .from('scores')
-        .insert({
-          id: uuidv4(), // Generate UUID for new score record
-          username: trimmedUsername,
-          email: trimmedEmail,
-          score,
-          round,
-          combo,
-          correct,
-          wrong,
-          accuracy,
-          level,
-          created_at: now,
-          
+    if (existing) {
+      const { error } = await supabase
+        .from('users')
+        .update({
+          email: cleanEmail || null,
+          updated_at: new Date().toISOString()
         })
-        .select();
-      if (error) {
-        // Handle potential unique constraint violation on username if defined in DB
-        if (error.code === '23505') {
-          console.warn(`[Supabase Warning] Duplicate username tried to be inserted into scores: ${trimmedUsername}`);
-          return res.status(409).json({ success: false, error: 'A score for this username already exists.' });
-        }
-        console.error('[Supabase Error] Inserting new score:', error);
-        throw error;
-      }
-      resultData = data[0];
-      console.log(`[API] New score for ${trimmedUsername} inserted: ${score}`);
+        .eq('id', existing.id);
+      if (error) throw error;
+      return res.json({ updated: true, username: cleanUsername });
     }
 
-    res.status(200).json({ success: true, data: resultData });
-  } catch (error) {
-    console.error('[API Error] Post score:', error.message || error);
-    res.status(500).json({ success: false, error: error.message || 'Failed to post score.' });
+    const { error } = await supabase
+      .from('users')
+      .insert({
+        username: cleanUsername,
+        email: cleanEmail || null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      });
+    if (error) throw error;
+    res.status(201).json({ created: true, username: cleanUsername });
+  } catch (err) {
+    next(err);
   }
 });
 
-// Scores - Get All Scores
-app.get('/api/scores', async (req, res) => {
+app.post('/matches', async (req, res, next) => {
   try {
-    console.log('[API] Get all scores requested');
-    const { data, error } = await supabase
-      .from('scores')
-      .select('*');
-
-    if (error) {
-      console.error('[Supabase Error] Get all scores:', error);
-      throw error;
+    const { room_id, players, winner, duration, highest_score, status } = req.body || {};
+    if (!room_id || !Array.isArray(players)) {
+      return res.status(400).json({ error: 'Invalid match data: room_id and players array required' });
     }
-
-    res.status(200).json({ success: true, data });
-  } catch (error) {
-    console.error('[API Error] Get all scores:', error.message || error);
-    res.status(500).json({ success: false, error: error.message || 'Failed to retrieve scores.' });
+    const { error } = await supabase.from('matches').insert({
+      room_id: sanitizeString(room_id),
+      players,
+      winner: winner || null,
+      duration: typeof duration === 'number' ? duration : 0,
+      highest_score: typeof highest_score === 'number' ? highest_score : 0,
+      status: sanitizeString(status) || 'completed',
+      created_at: new Date().toISOString(),
+      finished_at: new Date().toISOString()
+    });
+    if (error) throw error;
+    res.status(201).json({ success: true });
+  } catch (err) {
+    next(err);
   }
 });
 
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
 
-// --- Socket.IO Handlers ---
-io.on('connection', (socket) => {
-  console.log(`[Socket.IO] User connected: ${socket.id}`);
-  socket.emit('connected', { message: 'Successfully connected to the game server.' });
-
-  socket.on('heartbeat', (data) => {
-    const roomCode = socket.data.roomId;
-    if (roomCode && activeMatches.has(roomCode)) {
-      activeMatches.get(roomCode).heartbeats.set(socket.id, Date.now());
-    }
+app.use((err, req, res, next) => {
+  logger.error('API error', {
+    message: err.message,
+    path: req.path,
+    method: req.method,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
   });
 
-  socket.on('createMatch', async ({ username }) => {
-    try {
-      if (!username) {
-        socket.emit('error', { message: 'Username is required to create a match.' });
-        return;
-      }
-      const trimmedUsername = username.trim();
-      console.log(`[Socket.IO] createMatch from ${trimmedUsername} (${socket.id})`);
-
-      // Check if user is already in a match
-      if (socket.data.roomId && activeMatches.has(socket.data.roomId)) {
-        socket.emit('error', { message: `You are already in a match (room ${socket.data.roomId}). Please leave it first.` });
-        return;
-      }
-
-      const roomCode = generateRoomCode();
-      const now = new Date().toISOString();
-
-      // Store match in Supabase
-      const { data, error } = await supabase
-        .from('matches')
-        .insert({
-          id: uuidv4(),
-          room_code: roomCode,
-          host_username: trimmedUsername,
-          status: 'waiting',
-          created_at: now,
-         
-        })
-        .select();
-
-      if (error) {
-        console.error('[Supabase Error] createMatch:', error);
-        socket.emit('error', { message: 'Failed to create match in database.' });
-        return;
-      }
-
-      socket.join(roomCode);
-      socket.data.roomId = roomCode;
-      socket.data.username = trimmedUsername;
-      userSocketMap.set(trimmedUsername, socket.id);
-      socketUserMap.set(socket.id, trimmedUsername);
-
-      const newMatch = new MatchState(roomCode, socket.id, trimmedUsername);
-      activeMatches.set(roomCode, newMatch);
-
-      io.to(roomCode).emit('matchCreated', { roomCode, host: trimmedUsername, match: newMatch.getPlayersInfo() });
-      io.to(roomCode).emit('roomUpdate', { match: newMatch.getPlayersInfo(), status: newMatch.status, host: newMatch.host.username, gameData: newMatch.gameData, chatHistory: newMatch.chatHistory });
-      console.log(`[Room Create] Room ${roomCode} created by ${trimmedUsername}.`);
-    } catch (error) {
-      console.error('[Socket.IO Error] createMatch:', error.message || error);
-      socket.emit('error', { message: 'Failed to create match.' });
-    }
-  });
-
-  socket.on('joinMatch', async ({ roomCode, username }) => {
-    try {
-      if (!roomCode || !username) {
-        socket.emit('error', { message: 'Room code and username are required to join a match.' });
-        return;
-      }
-      const trimmedUsername = username.trim();
-      const trimmedRoomCode = roomCode.trim();
-      console.log(`[Socket.IO] joinMatch by ${trimmedUsername} (${socket.id}) to room ${trimmedRoomCode}`);
-
-      let match = activeMatches.get(trimmedRoomCode);
-
-      if (!match) {
-        // Try to retrieve from DB in case server restarted or in-memory lost
-        const { data, error } = await supabase
-          .from('matches')
-          .select('*')
-          .eq('room_code', trimmedRoomCode)
-          .single();
-
-        if (error || !data) {
-          console.error('[Supabase Error] joinMatch - room not found in DB:', error?.message || 'No data');
-          socket.emit('error', { message: 'Match not found or already ended.' });
-          return;
-        }
-
-        // Reconstruct match state (basic)
-        // Note: Host socket ID is unknown, will be updated if host reconnects
-        match = new MatchState(data.room_code, null, data.host_username);
-        match.status = data.status;
-        if (data.guest_username) {
-          match.guest = { id: null, username: data.guest_username, isReady: false };
-          match.players.set(null, { username: data.guest_username, isReady: false, currentScore: 0 }); // Temporarily null ID
-          match.gameData.playersScores[data.guest_username] = 0;
-        }
-        activeMatches.set(trimmedRoomCode, match);
-        console.log(`[Socket.IO] Reconstructed match ${trimmedRoomCode} from database.`);
-      }
-
-      // Handle reconnection: if the username is already associated with a socket
-      if (userSocketMap.has(trimmedUsername)) {
-        const oldSocketId = userSocketMap.get(trimmedUsername);
-        if (oldSocketId !== socket.id) {
-          // If a user tries to join with the same username but a new socket, disconnect the old one
-          const oldSocket = io.sockets.sockets.get(oldSocketId);
-          if (oldSocket) {
-            console.log(`[Socket.IO] Disconnecting old socket ${oldSocketId} for user ${trimmedUsername} to allow reconnection.`);
-            oldSocket.emit('reconnectAttempt', { message: 'You have connected from another device. This connection will be closed.' });
-            oldSocket.disconnect(true);
-          }
-        }
-      }
-
-      // Check if trying to join a full room as a new player
-      if (match.getPlayerCount() >= 2 && !match.players.has(socket.id) && ![match.host?.username, match.guest?.username].includes(trimmedUsername)) {
-        socket.emit('error', { message: 'Match is full.' });
-        return;
-      }
-
-      // Cannot join a game in progress if not already part of it
-      if (match.status !== 'waiting' && !match.players.has(socket.id)) {
-        socket.emit('error', { message: 'Match has already started.' });
-        return;
-      }
-
-      // --- Player Reconnection/Join Logic ---
-      let playerInfo = match.players.get(socket.id);
-      let isReconnecting = false;
-
-      if (playerInfo && playerInfo.username === trimmedUsername) {
-        // This is the same socket and username, probably just re-emitting joinMatch
-        isReconnecting = true;
-      } else if (match.host && match.host.username === trimmedUsername) {
-        // Host rejoining, update socket ID
-        if (match.players.has(userSocketMap.get(trimmedUsername))) {
-            match.players.delete(userSocketMap.get(trimmedUsername)); // Remove old socket entry if any
-        }
-        match.host.id = socket.id;
-        playerInfo = { username: trimmedUsername, isReady: match.host.isReady, currentScore: match.gameData.playersScores[trimmedUsername] || 0 };
-        match.players.set(socket.id, playerInfo);
-        isReconnecting = true;
-      } else if (match.guest && match.guest.username === trimmedUsername) {
-        // Guest rejoining, update socket ID
-        if (match.players.has(userSocketMap.get(trimmedUsername))) {
-            match.players.delete(userSocketMap.get(trimmedUsername)); // Remove old socket entry if any
-        }
-        match.guest.id = socket.id;
-        playerInfo = { username: trimmedUsername, isReady: match.guest.isReady, currentScore: match.gameData.playersScores[trimmedUsername] || 0 };
-        match.players.set(socket.id, playerInfo);
-        isReconnecting = true;
-      } else if (!match.guest && match.host.username !== trimmedUsername) {
-        // New guest joining (and host is different)
-        match.guest = { id: socket.id, username: trimmedUsername, isReady: false };
-        playerInfo = { username: trimmedUsername, isReady: false, currentScore: 0 };
-        match.players.set(socket.id, playerInfo);
-        match.gameData.playersScores[trimmedUsername] = 0; // Initialize score for guest
-        isReconnecting = false;
-      } else if (match.host?.username === trimmedUsername && !match.host.id) {
-         // Host from DB but no active socket found yet
-         match.host.id = socket.id;
-         playerInfo = { username: trimmedUsername, isReady: match.host.isReady, currentScore: match.gameData.playersScores[trimmedUsername] || 0 };
-         match.players.set(socket.id, playerInfo);
-         isReconnecting = true;
-      }
-      else {
-        // Should not happen if logic is sound, but catches other cases like third player with new username
-        socket.emit('error', { message: 'A player with this username is already in the room or the room is full.' });
-        return;
-      }
-
-      socket.join(trimmedRoomCode);
-      socket.data.roomId = trimmedRoomCode;
-      socket.data.username = trimmedUsername;
-      userSocketMap.set(trimmedUsername, socket.id);
-      socketUserMap.set(socket.id, trimmedUsername);
-      match.heartbeats.set(socket.id, Date.now()); // Reset heartbeat
-
-      // Update match status in DB (e.g., add guest username)
-      await supabase.from('matches').update({
-        guest_username: match.guest?.username || null,
-         new Date().toISOString()
-      }).eq('room_code', trimmedRoomCode);
-
-      if (isReconnecting) {
-        io.to(trimmedRoomCode).emit('playerRejoined', { username: trimmedUsername });
-        console.log(`[Room Join] Player ${trimmedUsername} (${socket.id}) reconnected to room ${trimmedRoomCode}.`);
-      } else {
-        io.to(trimmedRoomCode).emit('playerJoined', { username: trimmedUsername, roomCode: trimmedRoomCode });
-        console.log(`[Room Join] New player ${trimmedUsername} (${socket.id}) joined room ${trimmedRoomCode}.`);
-      }
-
-      // Always send full state on join/rejoin
-      io.to(trimmedRoomCode).emit('roomUpdate', {
-        match: match.getPlayersInfo(),
-        status: match.status,
-        host: match.host?.username,
-        gameData: match.gameData,
-        chatHistory: match.chatHistory
-      });
-      socket.emit('syncGameState', {
-        match: match.getPlayersInfo(),
-        status: match.status,
-        host: match.host?.username,
-        gameData: match.gameData,
-        chatHistory: match.chatHistory
-      });
-
-    } catch (error) {
-      console.error('[Socket.IO Error] joinMatch:', error.message || error);
-      socket.emit('error', { message: 'Failed to join match.' });
-    }
-  });
-
-  socket.on('leaveMatch', async () => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username) return;
-
-      console.log(`[Socket.IO] leaveMatch from ${username} (${socket.id}) in room ${roomCode}`);
-
-      socket.leave(roomCode);
-      socket.data.roomId = undefined;
-      userSocketMap.delete(username);
-      socketUserMap.delete(socket.id);
-
-      const match = activeMatches.get(roomCode);
-      if (match) {
-        match.players.delete(socket.id);
-        match.heartbeats.delete(socket.id);
-
-        if (match.host && match.host.id === socket.id) {
-          match.host = null;
-        } else if (match.guest && match.guest.id === socket.id) {
-          match.guest = null;
-        }
-
-        // If host left and guest exists, guest becomes host
-        if (!match.host && match.guest) {
-          console.log(`[Room Update] ${match.guest.username} became host for room ${roomCode}.`);
-          match.host = { ...match.guest };
-          match.guest = null;
-          // Update DB as well
-          await supabase.from('matches').update({
-            host_username: match.host.username,
-            guest_username: null,
-            new Date().toISOString()
-          }).eq('room_code', roomCode);
-        }
-
-        io.to(roomCode).emit('playerLeft', { username });
-
-        // Cleanup room if empty or single player not yet started
-        if (match.getPlayerCount() < 2 && (match.status === 'waiting' || match.status === 'countdown')) {
-          console.log(`[Room Cleanup] Deleting room ${roomCode} due to insufficient players.`);
-          activeMatches.delete(roomCode);
-          match.clearTimers();
-          io.to(roomCode).emit('matchCancelled', { message: 'Match cancelled due to host leaving or insufficient players.' });
-          // Update DB match status
-          await supabase.from('matches').update({
-            status: 'cancelled',
-            new Date().toISOString()
-          }).eq('room_code', roomCode);
-        } else if (match.getPlayerCount() === 0) {
-          console.log(`[Room Cleanup] Deleting empty room ${roomCode}.`);
-          activeMatches.delete(roomCode);
-          match.clearTimers();
-          await supabase.from('matches').update({
-            status: 'ended', // Or 'cancelled' depending on exact state
-            new Date().toISOString()
-          }).eq('room_code', roomCode);
-        } else {
-          io.to(roomCode).emit('roomUpdate', { match: match.getPlayersInfo(), status: match.status, host: match.host?.username, gameData: match.gameData, chatHistory: match.chatHistory });
-        }
-      }
-    } catch (error) {
-      console.error('[Socket.IO Error] leaveMatch:', error.message || error);
-      socket.emit('error', { message: 'Failed to leave match.' });
-    }
-  });
-
-  socket.on('cancelMatch', async () => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username) return;
-
-      const match = activeMatches.get(roomCode);
-      if (!match) return socket.emit('error', { message: 'Match not found.' });
-
-      if (match.host?.username !== username) {
-        socket.emit('error', { message: 'Only the host can cancel the match.' });
-        return;
-      }
-
-      console.log(`[Room Cancel] Host ${username} cancelled room ${roomCode}.`);
-      activeMatches.delete(roomCode);
-      match.clearTimers();
-      io.to(roomCode).emit('matchCancelled', { message: 'Host cancelled the match.' });
-
-      // Clean up player data and force them to leave the room
-      match.players.forEach((player, sockId) => {
-        const playerSocket = io.sockets.sockets.get(sockId);
-        if (playerSocket) {
-          playerSocket.leave(roomCode);
-          playerSocket.data.roomId = undefined;
-          // userSocketMap.delete(player.username); // This will be handled by disconnect if they fully disconnect
-          // socketUserMap.delete(sockId);
-        }
-      });
-      io.sockets.in(roomCode).socketsLeave(roomCode); // Ensure all sockets leave
-
-      // Update DB
-      await supabase.from('matches').update({
-        status: 'cancelled',
-       new Date().toISOString()
-      }).eq('room_code', roomCode);
-
-    } catch (error) {
-      console.error('[Socket.IO Error] cancelMatch:', error.message || error);
-      socket.emit('error', { message: 'Failed to cancel match.' });
-    }
-  });
-
-  socket.on('playerReady', () => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username) return;
-
-      const match = activeMatches.get(roomCode);
-      if (!match) return;
-
-      const player = match.players.get(socket.id);
-      if (player) {
-        player.isReady = true;
-        // Also update host/guest readiness states
-        if (match.host?.id === socket.id) match.host.isReady = true;
-        if (match.guest?.id === socket.id) match.guest.isReady = true;
-
-        io.to(roomCode).emit('roomUpdate', { match: match.getPlayersInfo(), status: match.status, host: match.host?.username, gameData: match.gameData, chatHistory: match.chatHistory });
-        console.log(`[Room Update] Player ${username} in room ${roomCode} is ready.`);
-      }
-    } catch (error) {
-      console.error('[Socket.IO Error] playerReady:', error.message || error);
-    }
-  });
-
-  socket.on('playerNotReady', () => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username) return;
-
-      const match = activeMatches.get(roomCode);
-      if (!match) return;
-
-      const player = match.players.get(socket.id);
-      if (player) {
-        player.isReady = false;
-        // Also update host/guest readiness states
-        if (match.host?.id === socket.id) match.host.isReady = false;
-        if (match.guest?.id === socket.id) match.guest.isReady = false;
-
-        io.to(roomCode).emit('roomUpdate', { match: match.getPlayersInfo(), status: match.status, host: match.host?.username, gameData: match.gameData, chatHistory: match.chatHistory });
-        console.log(`[Room Update] Player ${username} in room ${roomCode} is not ready.`);
-      }
-    } catch (error) {
-      console.error('[Socket.IO Error] playerNotReady:', error.message || error);
-    }
-  });
-
-  socket.on('startCountdown', () => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username) return;
-
-      const match = activeMatches.get(roomCode);
-      if (!match) return socket.emit('error', { message: 'Match not found.' });
-
-      if (match.host?.username !== username) {
-        socket.emit('error', { message: 'Only the host can start the countdown.' });
-        return;
-      }
-      if (!match.isEveryoneReady()) {
-        socket.emit('error', { message: 'All players must be ready to start the countdown.' });
-        return;
-      }
-      if (match.getPlayerCount() < 2) {
-        socket.emit('error', { message: 'At least two players are required to start the game.' });
-        return;
-      }
-      if (match.status !== 'waiting') {
-        socket.emit('error', { message: 'Match is not in waiting state.' });
-        return;
-      }
-
-      match.status = 'countdown';
-      let countdown = 5; // 5-second countdown
-      io.to(roomCode).emit('countdownStart', { count: countdown });
-      console.log(`[Game Start] Room ${roomCode} countdown started.`);
-
-      match.countdownInterval = setInterval(() => {
-        countdown--;
-        io.to(roomCode).emit('countdown', { count: countdown });
-        if (countdown <= 0) {
-          clearInterval(match.countdownInterval);
-          match.countdownInterval = null;
-          // Start the match
-          io.to(roomCode).emit('countdownEnd');
-          startGame(roomCode);
-        }
-      }, 1000);
-    } catch (error) {
-      console.error('[Socket.IO Error] startCountdown:', error.message || error);
-      socket.emit('error', { message: 'Failed to start countdown.' });
-    }
-  });
-
-  const startGame = async (roomCode) => {
-    try {
-      const match = activeMatches.get(roomCode);
-      if (!match) return;
-
-      match.status = 'playing';
-      match.resetGameData(); // Reset scores, rounds etc.
-      // Reset readiness here as well in case of issues
-      for (const player of match.players.values()) {
-        player.isReady = false;
-      }
-
-      // Update DB match status
-      await supabase.from('matches').update({
-        status: 'playing',
-         new Date().toISOString()
-      }).eq('room_code', roomCode);
-
-      console.log(`[Game Start] Room ${roomCode} game started.`);
-      io.to(roomCode).emit('startMatch', {
-        match: match.getPlayersInfo(),
-        gameData: match.gameData
-      });
-
-      startNewRound(roomCode);
-    } catch (error) {
-      console.error(`[Socket.IO Error] startGame for room ${roomCode}:`, error.message || error);
-      io.to(roomCode).emit('error', { message: 'Failed to start the game.' });
-    }
-  };
-
-  const startNewRound = (roomCode, level = 1) => {
-    const match = activeMatches.get(roomCode);
-    if (!match) return;
-
-    match.gameData.round++;
-    const MAX_ROUNDS = 10; // Example: 10 rounds per game
-    if (match.gameData.round > MAX_ROUNDS) {
-      endMatch(roomCode);
-      return;
-    }
-
-    if (match.gameRoundTimeout) clearTimeout(match.gameRoundTimeout);
-    if (match.gameInterval) clearInterval(match.gameInterval);
-
-    const { equation, correctAnswer } = generateEquation(level); // Use current game level
-    match.gameData.equation = equation;
-    match.gameData.correctAnswer = correctAnswer;
-    match.gameData.timer = 15; // 15 seconds per round
-
-    // Reset player's answered status for the new round if implementing immediate round progression
-    // for (const player of match.players.values()) {
-    //   player.hasAnsweredThisRound = false;
-    // }
-
-    io.to(roomCode).emit('roundUpdate', {
-      round: match.gameData.round,
-      equation,
-      timer: match.gameData.timer,
-      playersScores: match.gameData.playersScores
-    });
-    console.log(`[Game Round] Room ${roomCode} - Round ${match.gameData.round}: ${equation} = ${correctAnswer}`);
-
-    match.gameInterval = setInterval(() => {
-      if (match.gameData.timer <= 0) {
-        clearInterval(match.gameInterval);
-        match.gameInterval = null;
-        // Move to next round after timeout
-        startNewRound(roomCode, level);
-      } else {
-        match.gameData.timer--;
-        io.to(roomCode).emit('timerUpdate', { timer: match.gameData.timer });
-      }
-    }, 1000);
-
-    // Timeout to proceed to next round even if game timer is paused or something
-    match.gameRoundTimeout = setTimeout(() => {
-      if (match.gameData.timer > 0) { // If timer still running, clear it to avoid double-triggering
-        clearInterval(match.gameInterval);
-        match.gameInterval = null;
-      }
-      console.log(`[Game Timeout] Round ${match.gameData.round} in room ${roomCode} timed out. Advancing round.`);
-      startNewRound(roomCode, level);
-    }, match.gameData.timer * 1000 + 1000); // Give an extra second for final timer update/network latency
-  };
-
-
-  socket.on('submitAnswer', ({ answer }) => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username) return;
-
-      const match = activeMatches.get(roomCode);
-      if (!match || match.status !== 'playing') return socket.emit('error', { message: 'Game is not currently playing.' });
-
-      const player = match.players.get(socket.id);
-      if (!player) return;
-
-      const isCorrect = parseInt(answer, 10) === match.gameData.correctAnswer;
-      let scoreChange = 0;
-      if (isCorrect) {
-        scoreChange = 100 + (match.gameData.timer * 10); // Base score + bonus for speed
-        player.currentScore += scoreChange;
-        match.gameData.playersScores[username] = player.currentScore;
-        console.log(`[Game Answer] Player ${username} in room ${roomCode} submitted correct answer. Score: ${player.currentScore}`);
-        io.to(roomCode).emit('scoreUpdate', { username, score: player.currentScore, isCorrect: true, scoreChange });
-      } else {
-        scoreChange = -20; // Penalty for wrong answer
-        player.currentScore += scoreChange;
-        match.gameData.playersScores[username] = player.currentScore;
-        console.log(`[Game Answer] Player ${username} in room ${roomCode} submitted wrong answer. Score: ${player.currentScore}`);
-        io.to(roomCode).emit('scoreUpdate', { username, score: player.currentScore, isCorrect: false, scoreChange });
-      }
-
-      // If all players have answered, potentially advance the round faster
-      // This part is commented out as round progression is primarily timer-driven for simplicity.
-      // If immediate progression is desired, 'player.hasAnsweredThisRound' would need to be tracked.
-      // player.hasAnsweredThisRound = true;
-      // if (Array.from(match.players.values()).every(p => p.hasAnsweredThisRound)) {
-      //   startNewRound(roomCode, match.gameData.level);
-      // }
-    } catch (error) {
-      console.error('[Socket.IO Error] submitAnswer:', error.message || error);
-      socket.emit('error', { message: 'Failed to submit answer.' });
-    }
-  });
-
-  const endMatch = async (roomCode) => {
-    try {
-      const match = activeMatches.get(roomCode);
-      if (!match) return;
-
-      match.status = 'ended';
-      match.clearTimers(); // Clear all intervals and timeouts
-
-      let winner = 'Draw';
-      let highestScore = -Infinity;
-      let winnerUsername = null;
-      let scoresToUpdate = [];
-
-      // Determine winner and prepare scores for DB update
-      for (const [socketId, player] of match.players.entries()) {
-        const username = player.username;
-        const score = player.currentScore;
-
-        scoresToUpdate.push({ username, score });
-
-        if (score > highestScore) {
-          highestScore = score;
-          winnerUsername = username;
-          winner = username;
-        } else if (score === highestScore && winnerUsername !== null) {
-          winner = 'Draw'; // If multiple players have same highest score
-        }
-      }
-
-      // Post final score to DB for each player
-      for (const { username: playerUsername, score: finalScore } of scoresToUpdate) {
-        // Fetch existing score for this player from 'scores' table
-        const { data: existingScore, error: fetchScoreError } = await supabase
-          .from('scores')
-          .select('id, score')
-          .eq('username', playerUsername)
-          .single();
-
-        if (fetchScoreError && fetchScoreError.code !== 'PGRST116') {
-          console.error(`[Supabase Error] Fetching score for ${playerUsername} on match end:`, fetchScoreError);
-          continue;
-        }
-
-        const now = new Date().toISOString();
-        if (existingScore) {
-          if (finalScore > existingScore.score) {
-            await supabase.from('scores').update({
-              score: finalScore,
-              now,
-              // Update other game stats if tracked (combo, correct, wrong, accuracy, level)
-              // For now, using default/placeholder values as per original prompt for these not explicitly managed by game logic
-              round: match.gameData.round,
-              combo: 0, // Placeholder
-              correct: 0, // Placeholder
-              wrong: 0, // Placeholder
-              accuracy: 0.0, // Placeholder
-              level: 1, // Placeholder
-            }).eq('id', existingScore.id);
-            console.log(`[Supabase] Final score for ${playerUsername} updated to new high: ${finalScore}`);
-          } else {
-            await supabase.from('scores').update({ updated_at: now }).eq('id', existingScore.id);
-            console.log(`[Supabase] Final score for ${playerUsername} not higher, only`);
-          }
-        } else {
-          // No existing score, insert new one
-          await supabase.from('scores').insert({
-            id: uuidv4(),
-            username: playerUsername,
-            email: `${playerUsername}@equacards.com`, // Placeholder email, should ideally come from user registration
-            score: finalScore,
-            round: match.gameData.round,
-            combo: 0, // Placeholder
-            correct: 0, // Placeholder
-            wrong: 0, // Placeholder
-            accuracy: 0.0, // Placeholder
-            level: 1, // Placeholder
-            created_at: now,
-          : now
-          });
-          console.log(`[Supabase] New final score for ${playerUsername} inserted: ${finalScore}`);
-        }
-      }
-
-      // Update match status and winner in DB
-      await supabase.from('matches').update({
-        status: 'ended',
-        winner: winner === 'Draw' ? null : winnerUsername, // Store winner or null for draw
-       : new Date().toISOString()
-      }).eq('room_code', roomCode);
-
-      io.to(roomCode).emit('matchEnded', {
-        scores: match.gameData.playersScores,
-        winner: winnerUsername,
-        message: winnerUsername === 'Draw' ? 'It\'s a draw!' : `${winnerUsername} wins!`
-      });
-      console.log(`[Game End] Room ${roomCode} match ended. Winner: ${winner}.`);
-
-      // Keep room active for a bit to allow rematch, then clean up
-      setTimeout(() => {
-        if (activeMatches.has(roomCode) && activeMatches.get(roomCode).status === 'ended') {
-          console.log(`[Room Cleanup] Removing ended room ${roomCode} after timeout.`);
-          activeMatches.delete(roomCode);
-          io.to(roomCode).socketsLeave(roomCode); // Force all sockets to leave the room
-        }
-      }, 5 * 60 * 1000); // 5 minutes after match ends for rematch possibility
-    } catch (error) {
-      console.error(`[Socket.IO Error] endMatch for room ${roomCode}:`, error.message || error);
-      io.to(roomCode).emit('error', { message: 'An error occurred while ending the match.' });
-    }
-  };
-
-
-  socket.on('rematch', async () => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username) return;
-
-      const match = activeMatches.get(roomCode);
-      if (!match) return socket.emit('error', { message: 'Match not found.' });
-
-      if (match.status !== 'ended') {
-        socket.emit('error', { message: 'Match must be ended to request a rematch.' });
-        return;
-      }
-
-      // Reset players readiness and game data
-      match.resetGameData(); // This also resets status to 'waiting' and player scores to 0
-      match.chatHistory = []; // Clear chat for new match
-
-      // Notify all players in the room about the rematch request
-      io.to(roomCode).emit('rematchRequested', { username });
-      io.to(roomCode).emit('roomUpdate', { match: match.getPlayersInfo(), status: match.status, host: match.host?.username, gameData: match.gameData, chatHistory: match.chatHistory });
-      console.log(`[Game Rematch] Player ${username} requested rematch in room ${roomCode}.`);
-
-      // Update match status in DB
-      await supabase.from('matches').update({
-        status: 'waiting',
-        winner: null,
-       : new Date().toISOString()
-      }).eq('room_code', roomCode);
-    } catch (error) {
-      console.error('[Socket.IO Error] rematch:', error.message || error);
-      socket.emit('error', { message: 'Failed to request rematch.' });
-    }
-  });
-
-
-  socket.on('chatMessage', ({ message }) => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username || !message || message.trim() === '') return;
-
-      const match = activeMatches.get(roomCode);
-      if (!match) return;
-
-      const chatEntry = { username, message: message.trim(), timestamp: Date.now() };
-      match.chatHistory.push(chatEntry);
-      if (match.chatHistory.length > 50) { // Keep chat history limited to last 50 messages
-        match.chatHistory.shift();
-      }
-
-      io.to(roomCode).emit('chatMessage', chatEntry);
-      console.log(`[Chat] Room ${roomCode} - ${username}: ${message.trim()}`);
-    } catch (error) {
-      console.error('[Socket.IO Error] chatMessage:', error.message || error);
-    }
-  });
-
-  socket.on('typing', ({ isTyping }) => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      if (!roomCode || !username) return;
-
-      // Broadcast to all in the room EXCEPT the sender
-      socket.to(roomCode).emit('typing', { username, isTyping });
-    } catch (error) {
-      console.error('[Socket.IO Error] typing:', error.message || error);
-    }
-  });
-
-
-  socket.on('disconnect', async () => {
-    try {
-      const roomCode = socket.data.roomId;
-      const username = socket.data.username;
-      console.log(`[Socket.IO] User disconnected: ${socket.id}${username ? ` (${username})` : ''}`);
-
-      if (username) {
-        userSocketMap.delete(username);
-        socketUserMap.delete(socket.id);
-      }
-
-      if (roomCode && activeMatches.has(roomCode)) {
-        const match = activeMatches.get(roomCode);
-        match.heartbeats.delete(socket.id); // Remove heartbeat entry
-
-        // Remove the disconnected socket from the players list
-        match.players.delete(socket.id);
-
-        io.to(roomCode).emit('playerLeft', { username });
-        console.log(`[Room Update] Player ${username} left room ${roomCode}.`);
-
-        if (match.host && match.host.id === socket.id) {
-          match.host = null;
-        } else if (match.guest && match.guest.id === socket.id) {
-          match.guest = null;
-        }
-
-        // If guest is present and host left, promote guest to host
-        if (!match.host && match.guest) {
-          console.log(`[Room Update] Promoting ${match.guest.username} to host in room ${roomCode}.`);
-          match.host = { ...match.guest };
-          match.guest = null;
-          // Update DB as well
-          await supabase.from('matches').update({
-            host_username: match.host.username,
-            guest_username: null,
-        : new Date().toISOString()
-          }).eq('room_code', roomCode);
-        }
-
-        // Cleanup room if empty or single player not yet started
-        if (match.getPlayerCount() < 2 && (match.status === 'waiting' || match.status === 'countdown')) {
-          console.log(`[Room Cleanup] Deleting room ${roomCode} due to insufficient players.`);
-          activeMatches.delete(roomCode);
-          match.clearTimers();
-          io.to(roomCode).emit('matchCancelled', { message: 'Match cancelled due to host leaving or insufficient players.' });
-          await supabase.from('matches').update({
-            status: 'cancelled',
-           : new Date().toISOString()
-          }).eq('room_code', roomCode);
-        } else if (match.getPlayerCount() === 0) {
-          console.log(`[Room Cleanup] Deleting empty room ${roomCode}.`);
-          activeMatches.delete(roomCode);
-          match.clearTimers();
-          await supabase.from('matches').update({
-            status: 'ended', // Or 'cancelled' if no game started
-         : new Date().toISOString()
-          }).eq('room_code', roomCode);
-        } else {
-          // If match continues with remaining players, send room update
-          io.to(roomCode).emit('roomUpdate', { match: match.getPlayersInfo(), status: match.status, host: match.host?.username, gameData: match.gameData, chatHistory: match.chatHistory });
-        }
-      }
-    } catch (error) {
-      console.error('[Socket.IO Error] disconnect:', error.message || error);
-    }
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ error: 'Invalid JSON payload' });
+  }
+
+  if (err.message === 'Not allowed by CORS') {
+    return res.status(403).json({ error: 'CORS origin not allowed' });
+  }
+
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal server error'
   });
 });
 
+const cleanupInterval = setInterval(() => {
+  try {
+    const expired = roomManager.cleanup();
+    for (const roomId of expired) {
+      io.to(roomId).emit('roomExpired', { roomId, reason: 'Room expired due to inactivity' });
+      roomManager.destroyRoom(roomId);
+      logger.info('Room expired and destroyed', { roomId });
+    }
+  } catch (err) {
+    logger.error('Cleanup error', { message: err.message });
+  }
+}, 60000);
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM signal received: closing HTTP server');
+const shutdown = (signal) => {
+  logger.info(`Received ${signal}, shutting down gracefully`);
+  clearInterval(cleanupInterval);
+  io.close(() => {
+    logger.info('Socket.IO server closed');
+  });
   httpServer.close(() => {
-    console.log('HTTP server closed');
+    logger.info('HTTP server closed');
     process.exit(0);
   });
+  setTimeout(() => {
+    logger.error('Forced shutdown after timeout');
+    process.exit(1);
+  }, 30000);
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception', { message: err.message, stack: err.stack });
+  shutdown('uncaughtException');
 });
 
-process.on('SIGINT', () => {
-  console.log('SIGINT signal received: closing HTTP server');
-  httpServer.close(() => {
-    console.log('HTTP server closed');
-    process.exit(0);
-  });
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled rejection', { reason: String(reason) });
 });
 
-// Start server
 httpServer.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`CORS allowed origin: https://equacards.netlify.app`);
+  logger.info('Server started', { port: PORT, env: process.env.NODE_ENV || 'production' });
 });
-
-/*
---- Supabase SQL Function for Leaderboard ---
-
-IMPORTANT: You need to create this function in your Supabase SQL editor for the /api/leaderboard endpoint to work correctly.
-
--- Function to get the highest score per username for the leaderboard
-CREATE OR REPLACE FUNCTION get_leaderboard(limit_val INT DEFAULT 10)
-RETURNS TABLE (username TEXT, highest_score INT)
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    RETURN QUERY
-    SELECT s.username, MAX(s.score) AS highest_score
-    FROM scores s
-    GROUP BY s.username
-    ORDER BY highest_score DESC
-    LIMIT limit_val;
-END;
-$$;
-
-*/
