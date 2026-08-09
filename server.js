@@ -179,16 +179,37 @@ app.get('/matches', async (req, res) => {
 
 app.post('/scores', async (req, res) => {
   try {
+    const { username, score } = req.body;
+
+    if (!username) {
+      return res.status(400).json({
+        success: false,
+        error: 'Username is required'
+      });
+    }
+
     const { data, error } = await supabase
       .from('scores')
-      .insert([req.body])
+      .upsert(
+        {
+          username: username,
+          score: score
+        },
+        {
+          onConflict: 'username'
+        }
+      )
       .select();
 
     if (error) {
       throw error;
     }
 
-    res.status(201).json(data);
+    res.status(200).json({
+      success: true,
+      data
+    });
+
   } catch (err) {
     console.error('POST /scores error:', err);
 
