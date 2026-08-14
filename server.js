@@ -374,6 +374,41 @@ io.on('connection', (socket) => {
     startMatchIfReady(roomId);
   });
 
+  socket.on('leaveMatch', (data) => {
+    const roomId = data?.roomId || data;
+    const room = matchRooms[roomId];
+
+    if (!room) return;
+
+    const remainingId = room.host === socket.id ? room.opponent : room.host;
+    socket.leave(roomId);
+
+    if (room.host === socket.id) {
+      room.host = room.opponent || null;
+      room.hostName = room.opponentName || null;
+    }
+    if (room.opponent === socket.id) {
+      room.opponent = null;
+      room.opponentName = null;
+    }
+    room.ready = {};
+    room.status = room.host ? 'waiting' : 'closed';
+    room.winnerId = null;
+    room.loserId = null;
+
+    if (remainingId) {
+      io.to(remainingId).emit('playerLeft', {
+        roomId,
+        playerId: socket.id,
+        message: 'Opponent left the room'
+      });
+    }
+
+    if (!room.host) {
+      delete matchRooms[roomId];
+    }
+  });
+
   socket.on('matchSubmission', (data) => {
     const { roomId, expression } = data || {};
     const room = matchRooms[roomId];
@@ -432,13 +467,27 @@ io.on('connection', (socket) => {
       if (room.host === socket.id || room.opponent === socket.id) {
         console.log(`[MATCH] Cleaning up room ${roomId} due to disconnect`);
 
-        // Notify remaining player
-        io.to(roomId).emit('playerLeft', { playerId: socket.id });
+        const remainingId = room.host === socket.id ? room.opponent : room.host;
+        if (remainingId) {
+          io.to(roomId).emit('playerLeft', { playerId: socket.id, roomId, message: 'Opponent left the room' });
+        }
 
-        // Delete room after a delay
-        setTimeout(() => {
+        if (room.host === socket.id) {
+          room.host = room.opponent || null;
+          room.hostName = room.opponentName || null;
+        }
+        if (room.opponent === socket.id) {
+          room.opponent = null;
+          room.opponentName = null;
+        }
+        room.ready = {};
+        room.status = room.host ? 'waiting' : 'closed';
+        room.winnerId = null;
+        room.loserId = null;
+
+        if (!room.host) {
           delete matchRooms[roomId];
-        }, 5000);
+        }
       }
     }
   });
