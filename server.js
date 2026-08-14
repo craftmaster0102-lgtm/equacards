@@ -627,21 +627,20 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
     const payload = {
       username,
       score: Number(score) || 0,
+      round: req.body.round || 1,
+      combo: req.body.combo || 0,
+      correct: req.body.correct || 0,
+      wrong: req.body.wrong || 0,
+      accuracy: req.body.accuracy || 0,
+      level: req.body.level || 1,
+      email: req.body.email || '',
       created_at: new Date().toISOString()
     };
 
-    let { data, error } = await supabase
+    const { data, error } = await supabase
       .from('scores')
-      .upsert(payload, { onConflict: 'username' })
+      .insert([payload])
       .select();
-
-    if (error && error.code === '42501') {
-      console.warn('[SUPABASE] RLS blocked upsert. Trying insert fallback.');
-      ({ data, error } = await supabase
-        .from('scores')
-        .insert([payload])
-        .select());
-    }
 
     if (error) {
       return res.status(200).json({
