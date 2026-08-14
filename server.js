@@ -19,7 +19,13 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 10000;
 
 const CORS_ORIGIN =
-  process.env.CORS_ORIGIN || 'https://equacards.netlify.app';
+  process.env.CORS_ORIGIN ||
+  'https://equacard.netlify.app,https://www.equacard.netlify.app,https://equacards.netlify.app,https://www.equacards.netlify.app,https://equacards.pages.dev,http://localhost:3000,http://localhost:5173,http://localhost:8080,http://127.0.0.1:3000,http://127.0.0.1:5173,http://127.0.0.1:8080';
+
+const ALLOWED_ORIGINS = CORS_ORIGIN
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 // ==========================================
 // SUPABASE
@@ -37,17 +43,7 @@ const supabase = createClient(
 app.use(
   cors({
     origin: function(origin, callback) {
-      const allowedOrigins = [
-        'https://equacards.netlify.app',
-        'https://equacards.pages.dev',
-        'http://localhost:3000',
-        'http://localhost:5173',
-        'http://localhost:8080',
-        'http://127.0.0.1:3000',
-        'http://127.0.0.1:5173',
-        'http://127.0.0.1:8080'
-      ];
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
         callback(null, true);
       } else {
         callback(new Error('Not allowed by CORS'));
@@ -68,17 +64,7 @@ app.use(express.json());
 const io = new Server(server, {
   cors: {
     origin: function(origin, callback) {
-      const allowedOrigins = [
-        'https://equacards.netlify.app',
-        'https://equacards.pages.dev',
-        'http://localhost:3000',
-        'http://localhost:5173',
-        'http://localhost:8080',
-        'http://127.0.0.1:3000',
-        'http://127.0.0.1:5173',
-        'http://127.0.0.1:8080'
-      ];
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
         callback(null, true);
       } else {
         callback(new Error('Not allowed by CORS'));
