@@ -145,6 +145,85 @@ function generateRoomCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+function evaluateExpressionValue(expression) {
+  const sanitized = (expression || '').replace(/\s+/g, '');
+  if (!sanitized) return null;
+
+  const safeExpression = sanitized.replace(/[^0-9+\-*/().]/g, '');
+  if (safeExpression !== sanitized) return null;
+
+  try {
+    const value = Function(`"use strict"; return (${safeExpression});`)();
+    return Number.isFinite(value) ? Math.round(value) : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function generateRoundState(level = 1) {
+  const safeLevel = Math.max(1, Math.min(4, Number(level) || 1));
+  const numCount = safeLevel === 1 ? 3 : (safeLevel < 4 ? 4 : 5);
+  const maxNum = safeLevel === 1 ? 20 : (safeLevel === 2 ? 30 : (safeLevel === 3 ? 50 : 100));
+  const ops = safeLevel === 1 ? ['+', '-'] : (safeLevel === 2 ? ['+', '-', '*'] : ['+', '-', '*', '/']);
+
+  const numbers = Array.from({ length: numCount }, () => Math.floor(Math.random() * maxNum) + 1);
+  let target = numbers.reduce((a, b) => a + b, 0);
+
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const shuffled = [...numbers].sort(() => Math.random() - 0.5);
+    let val = shuffled[0];
+    for (let i = 0; i < numCount - 1; i++) {
+      const op = ops[Math.floor(Math.random() * ops.length)];
+      const next = shuffled[i + 1];
+      if (op === '+') val += next;
+      else if (op === '-') val -= next;
+      else if (op === '*') val *= next;
+      else if (op === '/') val = next !== 0 ? Math.floor(val / next) : val;
+    }
+    if (Math.abs(val) > 0 && Math.abs(val) <= 999) { target = Math.abs(val); break; }
+  }
+
+  const cards = [];
+  numbers.forEach((n) => cards.push({ type: 'num', value: n }));
+  ops.forEach((o) => cards.push({ type: 'op', value: o }));
+  if (safeLevel >= 3) {
+    cards.push({ type: 'paren', value: '(' });
+    cards.push({ type: 'paren', value: ')' });
+  }
+
+  return {
+    level: safeLevel,
+    target,
+    numbers: [...numbers],
+    operators: [...ops],
+    cards: cards.map((card) => ({ ...card })),
+    timer: 30
+  };
+}
+
+function startMatchIfReady(roomId) {
+  const room = matchRooms[roomId];
+  if (!room) return;
+
+  if (!room.host || !room.opponent) return;
+  if (!room.ready[room.host] || !room.ready[room.opponent]) return;
+  if (room.status === 'playing' || room.status === 'finished') return;
+
+  room.status = 'playing';
+  room.roundState = generateRoundState(room.level || 1);
+  room.startedAt = Date.now();
+
+  io.to(roomId).emit('matchStart', {
+    roomId,
+    players: [
+      { id: room.host, name: room.hostName },
+      { id: room.opponent, name: room.opponentName }
+    ],
+    roundState: room.roundState,
+    startedAt: room.startedAt
+  });
+}
+
 // ==========================================
 // SOCKET CONNECTION
 // ==========================================
@@ -176,6 +255,11 @@ io.on('connection', (socket) => {
         opponent: null,
         opponentName: null,
         status: 'waiting',
+        ready: {},
+        level: 1,
+        roundState: null,
+        winnerId: null,
+        loserId: null,
         createdAt: new Date().toISOString()
       };
 
@@ -230,6 +314,7 @@ io.on('connection', (socket) => {
       room.opponent = socket.id;
       room.opponentName = playerName;
       room.status = 'ready';
+      room.ready = {};
 
       // Update Supabase only if configured; otherwise continue with in-memory room state.
       const updateResult = await updateMatchRecord(roomId, {
@@ -277,9 +362,39 @@ io.on('connection', (socket) => {
     const { roomId } = data;
     const room = matchRooms[roomId];
 
-    if (room) {
-      console.log(`[MATCH] Player ready in ${roomId}: ${socket.id}`);
-      io.to(roomId).emit('playerReadyAck', { playerId: socket.id });
+    if (!room) return;
+
+    room.ready[socket.id] = true;
+    console.log(`[MATCH] Player ready in ${roomId}: ${socket.id}`);
+    io.to(roomId).emit('playerReadyAck', { playerId: socket.id });
+    startMatchIfReady(roomId);
+  });
+
+  socket.on('matchSubmission', (data) => {
+    const { roomId, expression } = data || {};
+    const room = matchRooms[roomId];
+
+    if (!room || room.status !== 'playing') return;
+
+    const value = evaluateExpressionValue(expression);
+    const target = room.roundState?.target;
+    if (value === null || target === null || typeof target === 'undefined') return;
+
+    if (value === target) {
+      room.status = 'finished';
+      room.winnerId = socket.id;
+      room.loserId = socket.id === room.host ? room.opponent : room.host;
+
+      io.to(roomId).emit('matchResult', {
+        roomId,
+        winnerId: room.winnerId,
+        loserId: room.loserId,
+        winnerName: socket.id === room.host ? room.hostName : room.opponentName,
+        loserName: socket.id === room.host ? room.opponentName : room.hostName,
+        target,
+        expression,
+        status: 'finished'
+      });
     }
   });
 
