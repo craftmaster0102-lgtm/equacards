@@ -42,10 +42,56 @@ function isAllowedOrigin(origin) {
 // SUPABASE
 // ==========================================
 
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_KEY
-);
+const supabase = SUPABASE_URL && SUPABASE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_KEY)
+  : null;
+
+async function updateMatchRecord(roomId, updates) {
+  if (!supabase) return { ok: true, skipped: true };
+
+  try {
+    const { error } = await supabase
+      .from('matches')
+      .update(updates)
+      .eq('room_id', roomId);
+
+    if (error) {
+      console.warn('[MATCH] Supabase update skipped:', error.message);
+      return { ok: false, error };
+    }
+
+    return { ok: true, skipped: false };
+  } catch (err) {
+    console.warn('[MATCH] Supabase update failed:', err.message);
+    return { ok: false, error: err };
+  }
+}
+
+async function createMatchRecord(roomCode, playerName) {
+  if (!supabase) return { ok: true, skipped: true };
+
+  try {
+    const { error } = await supabase
+      .from('matches')
+      .insert([{
+        room_id: roomCode,
+        host_name: playerName,
+        opponent_name: null,
+        status: 'waiting',
+        created_at: new Date().toISOString()
+      }]);
+
+    if (error) {
+      console.warn('[MATCH] Supabase insert skipped:', error.message);
+      return { ok: false, error };
+    }
+
+    return { ok: true, skipped: false };
+  } catch (err) {
+    console.warn('[MATCH] Supabase insert failed:', err.message);
+    return { ok: false, error: err };
+  }
+}
 
 // ==========================================
 // CORS
@@ -133,22 +179,10 @@ io.on('connection', (socket) => {
         createdAt: new Date().toISOString()
       };
 
-      // Store match in Supabase
-      const { data: matchData, error: matchError } = await supabase
-        .from('matches')
-        .insert([{
-          room_id: roomCode,
-          host_name: playerName,
-          opponent_name: null,
-          status: 'waiting',
-          created_at: new Date().toISOString()
-        }])
-        .select();
-
-      if (matchError) {
-        console.error('Supabase insert error:', matchError);
-        socket.emit('createRoomError', 'Failed to create room');
-        return;
+      // Store match in Supabase only if configured; otherwise keep working in-memory.
+      const matchRecordResult = await createMatchRecord(roomCode, playerName);
+      if (matchRecordResult.ok === false && matchRecordResult.error && !supabase) {
+        console.warn('[MATCH] Supabase unavailable; continuing in-memory room creation');
       }
 
       // Join the socket to a room
@@ -197,17 +231,14 @@ io.on('connection', (socket) => {
       room.opponentName = playerName;
       room.status = 'ready';
 
-      // Update Supabase
-      const { error: updateError } = await supabase
-        .from('matches')
-        .update({
-          opponent_name: playerName,
-          status: 'ready'
-        })
-        .eq('room_id', roomId);
+      // Update Supabase only if configured; otherwise continue with in-memory room state.
+      const updateResult = await updateMatchRecord(roomId, {
+        opponent_name: playerName,
+        status: 'ready'
+      });
 
-      if (updateError) {
-        console.error('Supabase update error:', updateError);
+      if (updateResult.ok === false && updateResult.error && !supabase) {
+        console.warn('[MATCH] Supabase unavailable; continuing in-memory room join');
       }
 
       // Join the socket to the room
