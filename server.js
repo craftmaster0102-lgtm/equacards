@@ -27,6 +27,17 @@ const ALLOWED_ORIGINS = CORS_ORIGIN
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+
+  const hostname = new URL(origin).hostname;
+  const allowed = ALLOWED_ORIGINS.includes(origin);
+  const netlifyHost = hostname.endsWith('.netlify.app') || hostname.endsWith('.pages.dev');
+  const localHost = ['localhost', '127.0.0.1'].includes(hostname);
+
+  return allowed || netlifyHost || localHost;
+}
+
 // ==========================================
 // SUPABASE
 // ==========================================
@@ -40,21 +51,21 @@ const supabase = createClient(
 // CORS
 // ==========================================
 
-app.use(
-  cors({
-    origin: function(origin, callback) {
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'));
-      }
-    },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true
-  })
-);
+const corsOptions = {
+  origin: function(origin, callback) {
+    if (isAllowedOrigin(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+};
 
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 
 // ==========================================
@@ -64,7 +75,7 @@ app.use(express.json());
 const io = new Server(server, {
   cors: {
     origin: function(origin, callback) {
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      if (isAllowedOrigin(origin)) {
         callback(null, true);
       } else {
         callback(new Error('Not allowed by CORS'));
@@ -303,7 +314,7 @@ app.get('/', (req, res) => {
 // GET /leaderboard
 // ==========================================
 
-app.get('/leaderboard', async (req, res) => {
+app.get(['/leaderboard', '/api/leaderboard'], async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('scores')
@@ -329,7 +340,7 @@ app.get('/leaderboard', async (req, res) => {
 // GET /users
 // ==========================================
 
-app.get('/users', async (req, res) => {
+app.get(['/users', '/api/users'], async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('users')
@@ -354,7 +365,7 @@ app.get('/users', async (req, res) => {
 // GET /matches
 // ==========================================
 
-app.get('/matches', async (req, res) => {
+app.get(['/matches', '/api/matches'], async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('matches')
@@ -379,7 +390,7 @@ app.get('/matches', async (req, res) => {
 // POST /scores
 // ==========================================
 
-app.post('/scores', async (req, res) => {
+app.post(['/scores', '/api/scores'], async (req, res) => {
   try {
     const { username, score } = req.body;
 
@@ -426,7 +437,7 @@ app.post('/scores', async (req, res) => {
 // POST /users
 // ==========================================
 
-app.post('/users', async (req, res) => {
+app.post(['/users', '/api/users'], async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('users')
@@ -452,7 +463,7 @@ app.post('/users', async (req, res) => {
 // POST /matches
 // ==========================================
 
-app.post('/matches', async (req, res) => {
+app.post(['/matches', '/api/matches'], async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('matches')
