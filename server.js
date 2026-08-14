@@ -14,7 +14,7 @@ const server = http.createServer(app);
 // ==========================================
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_PUBLISHABLE_KEY;
 
 const PORT = process.env.PORT || 10000;
 
@@ -45,6 +45,10 @@ function isAllowedOrigin(origin) {
 const supabase = SUPABASE_URL && SUPABASE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_KEY)
   : null;
+
+if (!supabase) {
+  console.warn('[CONFIG] Supabase is not configured. Set SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY in the backend environment.');
+}
 
 async function updateMatchRecord(roomId, updates) {
   if (!supabase) return { ok: true, skipped: true };
@@ -462,6 +466,13 @@ app.get('/', (req, res) => {
 
 app.get(['/leaderboard', '/api/leaderboard'], async (req, res) => {
   try {
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        error: 'Supabase is not configured. Set SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY.'
+      });
+    }
+
     const { data, error } = await supabase
       .from('scores')
       .select('*')
@@ -513,6 +524,13 @@ app.get(['/users', '/api/users'], async (req, res) => {
 
 app.get(['/matches', '/api/matches'], async (req, res) => {
   try {
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        error: 'Supabase is not configured. Set SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY.'
+      });
+    }
+
     const { data, error } = await supabase
       .from('matches')
       .select('*');
@@ -538,6 +556,13 @@ app.get(['/matches', '/api/matches'], async (req, res) => {
 
 app.post(['/scores', '/api/scores'], async (req, res) => {
   try {
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        error: 'Supabase is not configured. Set SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY.'
+      });
+    }
+
     const { username, score } = req.body;
 
     if (!username) {
@@ -547,18 +572,24 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
       });
     }
 
-    const { data, error } = await supabase
+    const payload = {
+      username,
+      score: Number(score) || 0,
+      created_at: new Date().toISOString()
+    };
+
+    let { data, error } = await supabase
       .from('scores')
-      .upsert(
-        {
-          username: username,
-          score: score
-        },
-        {
-          onConflict: 'username'
-        }
-      )
+      .upsert(payload, { onConflict: 'username' })
       .select();
+
+    if (error && error.code === '42501') {
+      console.warn('[SUPABASE] RLS blocked upsert. Trying insert fallback.');
+      ({ data, error } = await supabase
+        .from('scores')
+        .insert([payload])
+        .select());
+    }
 
     if (error) {
       throw error;
@@ -585,6 +616,13 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
 
 app.post(['/users', '/api/users'], async (req, res) => {
   try {
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        error: 'Supabase is not configured. Set SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY.'
+      });
+    }
+
     const { data, error } = await supabase
       .from('users')
       .insert([req.body])
@@ -611,9 +649,33 @@ app.post(['/users', '/api/users'], async (req, res) => {
 
 app.post(['/matches', '/api/matches'], async (req, res) => {
   try {
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        error: 'Supabase is not configured. Set SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY.'
+      });
+    }
+
+    const payload = {
+      room_id: req.body.room_id || req.body.roomId || null,
+      host_name: req.body.host_name || req.body.hostName || null,
+      opponent_name: req.body.opponent_name || req.body.opponentName || null,
+      winner_name: req.body.winner_name || req.body.winnerName || null,
+      loser_name: req.body.loser_name || req.body.loserName || null,
+      status: req.body.status || 'finished',
+      created_at: req.body.created_at || req.body.createdAt || new Date().toISOString()
+    };
+
+    if (!payload.room_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'room_id is required'
+      });
+    }
+
     const { data, error } = await supabase
       .from('matches')
-      .insert([req.body])
+      .insert([payload])
       .select();
 
     if (error) {
