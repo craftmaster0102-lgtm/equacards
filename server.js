@@ -607,8 +607,9 @@ app.get(['/matches', '/api/matches'], async (req, res) => {
 app.post(['/scores', '/api/scores'], async (req, res) => {
   try {
     if (!supabase) {
-      return res.status(503).json({
+      return res.status(200).json({
         success: false,
+        queuedLocally: true,
         error: 'Supabase is not configured. Set SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY.'
       });
     }
@@ -616,8 +617,9 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
     const { username, score } = req.body;
 
     if (!username) {
-      return res.status(400).json({
+      return res.status(200).json({
         success: false,
+        queuedLocally: true,
         error: 'Username is required'
       });
     }
@@ -642,7 +644,11 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
     }
 
     if (error) {
-      throw error;
+      return res.status(200).json({
+        success: false,
+        queuedLocally: true,
+        error: error.message
+      });
     }
 
     res.status(200).json({
@@ -653,8 +659,9 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
   } catch (err) {
     console.error('POST /scores error:', err);
 
-    res.status(500).json({
+    res.status(200).json({
       success: false,
+      queuedLocally: true,
       error: err.message
     });
   }
@@ -700,8 +707,9 @@ app.post(['/users', '/api/users'], async (req, res) => {
 app.post(['/matches', '/api/matches'], async (req, res) => {
   try {
     if (!supabase) {
-      return res.status(503).json({
+      return res.status(200).json({
         success: false,
+        queuedLocally: true,
         error: 'Supabase is not configured. Set SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY.'
       });
     }
@@ -717,8 +725,9 @@ app.post(['/matches', '/api/matches'], async (req, res) => {
     };
 
     if (!payload.room_id) {
-      return res.status(400).json({
+      return res.status(200).json({
         success: false,
+        queuedLocally: true,
         error: 'room_id is required'
       });
     }
@@ -729,15 +738,23 @@ app.post(['/matches', '/api/matches'], async (req, res) => {
       .select();
 
     if (error) {
-      throw error;
+      return res.status(200).json({
+        success: false,
+        queuedLocally: true,
+        error: error.message
+      });
     }
 
-    res.status(201).json(data);
+    res.status(200).json({
+      success: true,
+      data
+    });
   } catch (err) {
     console.error('POST /matches error:', err);
 
-    res.status(500).json({
+    res.status(200).json({
       success: false,
+      queuedLocally: true,
       error: err.message
     });
   }
