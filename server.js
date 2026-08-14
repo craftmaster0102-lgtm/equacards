@@ -395,6 +395,7 @@ io.on('connection', (socket) => {
     room.status = room.host ? 'waiting' : 'closed';
     room.winnerId = null;
     room.loserId = null;
+    room.roundState = null;
 
     if (remainingId) {
       io.to(remainingId).emit('playerLeft', {
