@@ -36,7 +36,6 @@ const supabase = createClient(
 
 app.use(
   cors({
-<<<<<<< HEAD
     origin: function(origin, callback) {
       const allowedOrigins = [
         'https://equacards.netlify.app',
@@ -54,12 +53,6 @@ app.use(
         callback(new Error('Not allowed by CORS'));
       }
     },
-=======
-    origin: [
-      'https://equacards.netlify.app',
-      'https://equacards.pages.dev'
-    ],
->>>>>>> cc4b019f75672219a575725033b092ced036c457
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true
@@ -74,7 +67,6 @@ app.use(express.json());
 
 const io = new Server(server, {
   cors: {
-<<<<<<< HEAD
     origin: function(origin, callback) {
       const allowedOrigins = [
         'https://equacards.netlify.app',
@@ -111,19 +103,6 @@ function generateRoomCode() {
 }
 
 // ==========================================
-=======
-    origin: [
-      'https://equacards.netlify.app',
-      'https://equacards.pages.dev'
-    ],
-    methods: ['GET', 'POST'],
-    credentials: true
-  },
-  transports: ['websocket', 'polling']
-});
-
-// ==========================================
->>>>>>> cc4b019f75672219a575725033b092ced036c457
 // SOCKET CONNECTION
 // ==========================================
 
@@ -133,7 +112,6 @@ io.on('connection', (socket) => {
   console.log('Socket ID:', socket.id);
   console.log('====================================');
 
-<<<<<<< HEAD
   // ==========================================
   // CREATE ROOM
   // ==========================================
@@ -141,7 +119,7 @@ io.on('connection', (socket) => {
     try {
       const { playerName } = data;
       let roomCode = generateRoomCode();
-      
+
       // Ensure unique room code
       while (matchRooms[roomCode]) {
         roomCode = generateRoomCode();
@@ -178,9 +156,9 @@ io.on('connection', (socket) => {
 
       // Join the socket to a room
       socket.join(roomCode);
-      
+
       console.log(`[MATCH] Room created: ${roomCode} by ${playerName} (${socket.id})`);
-      
+
       // Send room code to host
       socket.emit('roomCreated', {
         roomId: roomCode,
@@ -296,31 +274,26 @@ io.on('connection', (socket) => {
   // ==========================================
   // DISCONNECT
   // ==========================================
-=======
->>>>>>> cc4b019f75672219a575725033b092ced036c457
   socket.on('disconnect', (reason) => {
     console.log(
       `Socket disconnected: ${socket.id} | Reason: ${reason}`
     );
-<<<<<<< HEAD
 
     // Find and clean up match rooms
     for (const roomId in matchRooms) {
       const room = matchRooms[roomId];
       if (room.host === socket.id || room.opponent === socket.id) {
         console.log(`[MATCH] Cleaning up room ${roomId} due to disconnect`);
-        
+
         // Notify remaining player
         io.to(roomId).emit('playerLeft', { playerId: socket.id });
-        
+
         // Delete room after a delay
         setTimeout(() => {
           delete matchRooms[roomId];
         }, 5000);
       }
     }
-=======
->>>>>>> cc4b019f75672219a575725033b092ced036c457
   });
 
   socket.on('error', (error) => {
