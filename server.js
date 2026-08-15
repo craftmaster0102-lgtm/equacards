@@ -514,6 +514,12 @@ function generateRoundState(level = 1) {
     if (Math.abs(val) > 0 && Math.abs(val) <= 999) { target = Math.abs(val); break; }
   }
 
+  // Fallback: if no valid target found after all attempts, generate a simple one
+  if (target > 999 || target <= 0) {
+    target = numbers[0] + numbers[1]; // Simple sum of first two numbers
+    target = Math.max(1, Math.min(999, target)); // Ensure within valid range
+  }
+
   const cards = [];
   numbers.forEach((n) => cards.push({ type: 'num', value: n }));
   ops.forEach((o) => cards.push({ type: 'op', value: o }));
