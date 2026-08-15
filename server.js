@@ -785,6 +785,9 @@ io.on('connection', (socket) => {
     const playerName = slot === 'host' ? room.hostName : room.opponentName;
     const message = correct ? `${playerName} solved the target!` : `${playerName} submitted an answer.`;
 
+    const bothSubmitted = !!(room.roundResults[roundNumber].host && room.roundResults[roundNumber].opponent);
+    const shouldFinalizeNow = correct || bothSubmitted;
+
     io.to(roomId).emit('roundUpdate', {
       roomId,
       currentRound: roundNumber,
@@ -797,7 +800,7 @@ io.on('connection', (socket) => {
       players: buildRoomPlayers(room)
     });
 
-    if (room.roundResults[roundNumber].host && room.roundResults[roundNumber].opponent) {
+    if (shouldFinalizeNow) {
       finalizeRound(roomId);
     }
   });
