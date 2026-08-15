@@ -782,16 +782,23 @@ io.on('connection', (socket) => {
     const correct = value === target;
     room.roundResults[roundNumber][slot] = { correct, expression, submittedAt: Date.now() };
 
+    const playerName = slot === 'host' ? room.hostName : room.opponentName;
+    const message = correct ? `${playerName} solved the target!` : `${playerName} submitted an answer.`;
+
+    io.to(roomId).emit('roundUpdate', {
+      roomId,
+      currentRound: roundNumber,
+      playerId: socket.id,
+      playerName,
+      correct,
+      message,
+      matchStats: room.matchStats,
+      roundState: room.roundState,
+      players: buildRoomPlayers(room)
+    });
+
     if (room.roundResults[roundNumber].host && room.roundResults[roundNumber].opponent) {
       finalizeRound(roomId);
-    } else {
-      io.to(roomId).emit('roundUpdate', {
-        roomId,
-        currentRound: roundNumber,
-        matchStats: room.matchStats,
-        roundState: room.roundState,
-        players: buildRoomPlayers(room)
-      });
     }
   });
 
