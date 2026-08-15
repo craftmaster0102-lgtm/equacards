@@ -143,10 +143,337 @@ const io = new Server(server, {
 // MATCH ROOM MANAGER
 // ==========================================
 
-const matchRooms = {}; // { roomId: { host: socketId, hostName, opponent: socketId, opponentName, createdAt } }
+const matchRooms = {}; // { roomId: { host, hostName, opponent, opponentName, status, currentRound, ... } }
+const MATCH_RECONNECT_GRACE_MS = 15000;
+const ROUND_TRANSITION_DELAY_MS = 2500;
 
 function generateRoomCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function getRoomPlayerSlot(room, socketId) {
+  if (!room) return null;
+  if (room.host === socketId) return 'host';
+  if (room.opponent === socketId) return 'opponent';
+  return null;
+}
+
+function normalizeMatchStats() {
+  return {
+    round1Score: 0,
+    round2Score: 0,
+    totalScore: 0,
+    roundsWon: 0,
+    roundsLost: 0,
+    matchResult: null,
+    connected: true
+  };
+}
+
+function ensureRoomStats(room) {
+  room.matchStats = room.matchStats || {
+    host: normalizeMatchStats(),
+    opponent: normalizeMatchStats()
+  };
+  room.matchStats.host = room.matchStats.host || normalizeMatchStats();
+  room.matchStats.opponent = room.matchStats.opponent || normalizeMatchStats();
+  room.matchStats.host.connected = room.host ? true : false;
+  room.matchStats.opponent.connected = room.opponent ? true : false;
+}
+
+function buildRoomPlayers(room) {
+  ensureRoomStats(room);
+  return [
+    {
+      id: room.host,
+      name: room.hostName || 'Player 1',
+      score: Number(room.matchStats.host.totalScore || 0),
+      round1Score: Number(room.matchStats.host.round1Score || 0),
+      round2Score: Number(room.matchStats.host.round2Score || 0),
+      roundsWon: Number(room.matchStats.host.roundsWon || 0),
+      roundsLost: Number(room.matchStats.host.roundsLost || 0),
+      connected: !!room.host,
+      slot: 'host'
+    },
+    {
+      id: room.opponent,
+      name: room.opponentName || 'Player 2',
+      score: Number(room.matchStats.opponent.totalScore || 0),
+      round1Score: Number(room.matchStats.opponent.round1Score || 0),
+      round2Score: Number(room.matchStats.opponent.round2Score || 0),
+      roundsWon: Number(room.matchStats.opponent.roundsWon || 0),
+      roundsLost: Number(room.matchStats.opponent.roundsLost || 0),
+      connected: !!room.opponent,
+      slot: 'opponent'
+    }
+  ];
+}
+
+function buildMatchState(room) {
+  ensureRoomStats(room);
+  const players = buildRoomPlayers(room);
+  return {
+    roomId: room.roomId,
+    matchId: room.matchId || room.roomId,
+    status: room.status,
+    currentRound: Number(room.currentRound || 1),
+    maxRounds: 2,
+    players,
+    matchStats: room.matchStats,
+    roundState: room.roundState ? { ...room.roundState, timer: room.roundState.timer || 30 } : null
+  };
+}
+
+function emitMatchState(roomId) {
+  const room = matchRooms[roomId];
+  if (!room) return;
+  const payload = buildMatchState(room);
+  io.to(roomId).emit('matchState', payload);
+}
+
+function clearRoundTimer(room) {
+  if (!room) return;
+  if (room.roundTimeout) {
+    clearTimeout(room.roundTimeout);
+    room.roundTimeout = null;
+  }
+}
+
+function emitRoundTransition(roomId, roundNumber, roundSummary) {
+  const room = matchRooms[roomId];
+  if (!room) return;
+  room.status = `round${roundNumber}`;
+  room.roundState = generateRoundState(room.level || 1);
+  room.roundResults = room.roundResults || {};
+  room.roundResults[roundNumber] = room.roundResults[roundNumber] || { host: null, opponent: null };
+  room.roundTimeout = setTimeout(() => {
+    if (!matchRooms[roomId]) return;
+    const current = matchRooms[roomId];
+    if (!current.roundResults?.[roundNumber]?.host || !current.roundResults?.[roundNumber]?.opponent) {
+      current.roundResults = current.roundResults || {};
+      current.roundResults[roundNumber] = current.roundResults[roundNumber] || { host: null, opponent: null };
+      if (!current.roundResults[roundNumber].host) {
+        current.roundResults[roundNumber].host = { correct: false, expression: null, timedOut: true, submittedAt: Date.now() };
+      }
+      if (!current.roundResults[roundNumber].opponent) {
+        current.roundResults[roundNumber].opponent = { correct: false, expression: null, timedOut: true, submittedAt: Date.now() };
+      }
+    }
+    finalizeRound(roomId);
+  }, 30000);
+
+  io.to(roomId).emit('roundTransition', {
+    roomId,
+    matchId: room.matchId || roomId,
+    currentRound: roundNumber,
+    nextRound: roundNumber + 1,
+    roundSummary,
+    roundState: room.roundState,
+    players: buildRoomPlayers(room),
+    matchStats: room.matchStats
+  });
+  emitMatchState(roomId);
+}
+
+function finalizeRound(roomId) {
+  const room = matchRooms[roomId];
+  if (!room || !room.roundState) return;
+  clearRoundTimer(room);
+
+  const roundNumber = Number(room.currentRound || 1);
+  const roundSummary = room.roundResults?.[roundNumber] || { host: null, opponent: null };
+  const hostResult = roundSummary.host || { correct: false, expression: null };
+  const oppResult = roundSummary.opponent || { correct: false, expression: null };
+
+  const hostScore = !!hostResult.correct ? 100 : 0;
+  const oppScore = !!oppResult.correct ? 100 : 0;
+
+  const roundKey = roundNumber === 1 ? 'round1Score' : 'round2Score';
+  room.matchStats = room.matchStats || { host: normalizeMatchStats(), opponent: normalizeMatchStats() };
+  room.matchStats.host[roundKey] = hostScore;
+  room.matchStats.opponent[roundKey] = oppScore;
+  room.matchStats.host.totalScore = (room.matchStats.host.round1Score || 0) + (room.matchStats.host.round2Score || 0);
+  room.matchStats.opponent.totalScore = (room.matchStats.opponent.round1Score || 0) + (room.matchStats.opponent.round2Score || 0);
+
+  if (hostScore > oppScore) {
+    room.matchStats.host.roundsWon = (room.matchStats.host.roundsWon || 0) + 1;
+    room.matchStats.opponent.roundsLost = (room.matchStats.opponent.roundsLost || 0) + 1;
+  } else if (oppScore > hostScore) {
+    room.matchStats.opponent.roundsWon = (room.matchStats.opponent.roundsWon || 0) + 1;
+    room.matchStats.host.roundsLost = (room.matchStats.host.roundsLost || 0) + 1;
+  }
+
+  const roundWinner = hostScore === oppScore ? 'draw' : (hostScore > oppScore ? 'host' : 'opponent');
+  room.lastRoundResult = { round: roundNumber, winner: roundWinner, hostScore, oppScore, hostResult, oppResult };
+
+  if (roundNumber === 1) {
+    room.currentRound = 2;
+    room.status = 'round2';
+    room.roundState = generateRoundState(room.level || 1);
+    room.roundResults = room.roundResults || {};
+    room.roundResults[2] = { host: null, opponent: null };
+    room.roundStartedAt = Date.now();
+    room.roundTimeout = setTimeout(() => {
+      const current = matchRooms[roomId];
+      if (!current) return;
+      if (!current.roundResults?.[2]?.host) {
+        current.roundResults[2].host = { correct: false, expression: null, timedOut: true, submittedAt: Date.now() };
+      }
+      if (!current.roundResults?.[2]?.opponent) {
+        current.roundResults[2].opponent = { correct: false, expression: null, timedOut: true, submittedAt: Date.now() };
+      }
+      finalizeRound(roomId);
+    }, 30000);
+
+    io.to(roomId).emit('roundTransition', {
+      roomId,
+      matchId: room.matchId || roomId,
+      currentRound: 2,
+      nextRound: null,
+      roundSummary: room.lastRoundResult,
+      roundState: room.roundState,
+      players: buildRoomPlayers(room),
+      matchStats: room.matchStats,
+      transitionMessage: 'Round 1 complete. Round 2 starting...'
+    });
+    emitMatchState(roomId);
+    return;
+  }
+
+  room.status = 'finished';
+  room.matchResult = {
+    status: 'completed',
+    winnerId: room.matchStats.host.totalScore === room.matchStats.opponent.totalScore
+      ? null
+      : (room.matchStats.host.totalScore > room.matchStats.opponent.totalScore ? room.host : room.opponent),
+    winnerName: room.matchStats.host.totalScore === room.matchStats.opponent.totalScore
+      ? 'Draw'
+      : (room.matchStats.host.totalScore > room.matchStats.opponent.totalScore ? room.hostName : room.opponentName),
+    host: {
+      name: room.hostName,
+      round1: room.matchStats.host.round1Score,
+      round2: room.matchStats.host.round2Score,
+      totalScore: room.matchStats.host.totalScore,
+      roundsWon: room.matchStats.host.roundsWon,
+      roundsLost: room.matchStats.host.roundsLost
+    },
+    opponent: {
+      name: room.opponentName,
+      round1: room.matchStats.opponent.round1Score,
+      round2: room.matchStats.opponent.round2Score,
+      totalScore: room.matchStats.opponent.totalScore,
+      roundsWon: room.matchStats.opponent.roundsWon,
+      roundsLost: room.matchStats.opponent.roundsLost
+    },
+    matchId: room.matchId || room.roomId
+  };
+
+  io.to(roomId).emit('matchResult', {
+    roomId,
+    matchId: room.matchId || room.roomId,
+    winnerId: room.matchResult.winnerId,
+    winnerName: room.matchResult.winnerName,
+    loserName: room.matchResult.winnerId === room.host ? room.opponentName : room.hostName,
+    status: 'completed',
+    roundSummary: room.lastRoundResult,
+    matchStats: room.matchStats,
+    result: room.matchResult
+  });
+  emitMatchState(roomId);
+}
+
+function startRound(roomId, roundNumber) {
+  const room = matchRooms[roomId];
+  if (!room) return;
+  room.currentRound = roundNumber;
+  room.status = `round${roundNumber}`;
+  room.roundState = generateRoundState(room.level || 1);
+  room.roundResults = room.roundResults || {};
+  room.roundResults[roundNumber] = room.roundResults[roundNumber] || { host: null, opponent: null };
+  room.roundStartedAt = Date.now();
+
+  clearRoundTimer(room);
+  room.roundTimeout = setTimeout(() => {
+    const current = matchRooms[roomId];
+    if (!current) return;
+    if (!current.roundResults?.[roundNumber]?.host) {
+      current.roundResults[roundNumber].host = { correct: false, expression: null, timedOut: true, submittedAt: Date.now() };
+    }
+    if (!current.roundResults?.[roundNumber]?.opponent) {
+      current.roundResults[roundNumber].opponent = { correct: false, expression: null, timedOut: true, submittedAt: Date.now() };
+    }
+    finalizeRound(roomId);
+  }, 30000);
+
+  io.to(roomId).emit('roundStart', {
+    roomId,
+    matchId: room.matchId || roomId,
+    currentRound: roundNumber,
+    roundState: room.roundState,
+    players: buildRoomPlayers(room),
+    matchStats: room.matchStats,
+    status: room.status
+  });
+  emitMatchState(roomId);
+}
+
+function startMatchIfReady(roomId) {
+  const room = matchRooms[roomId];
+  if (!room) return;
+
+  if (!room.host || !room.opponent) return;
+  if (!room.ready[room.host] || !room.ready[room.opponent]) return;
+  if (room.status === 'playing' || room.status === 'finished' || room.status === 'round1' || room.status === 'round2') return;
+
+  room.status = 'countdown';
+  room.matchId = room.matchId || `${room.roomId}_${Date.now()}`;
+  room.currentRound = 1;
+  room.matchStats = {
+    host: { ...normalizeMatchStats(), connected: !!room.host },
+    opponent: { ...normalizeMatchStats(), connected: !!room.opponent }
+  };
+  room.roundResults = { 1: { host: null, opponent: null }, 2: { host: null, opponent: null } };
+  room.roundStartedAt = Date.now();
+
+  io.to(roomId).emit('matchStart', {
+    roomId,
+    matchId: room.matchId,
+    players: buildRoomPlayers(room),
+    currentRound: 1,
+    roundState: generateRoundState(room.level || 1),
+    startedAt: room.roundStartedAt,
+    matchStats: room.matchStats
+  });
+
+  setTimeout(() => {
+    const current = matchRooms[roomId];
+    if (current) {
+      startRound(roomId, 1);
+    }
+  }, 2500);
+}
+
+function scheduleReconnectCheck(roomId, slot) {
+  const room = matchRooms[roomId];
+  if (!room) return;
+  room.reconnectTimers = room.reconnectTimers || {};
+  if (room.reconnectTimers[slot]) clearTimeout(room.reconnectTimers[slot]);
+
+  room.reconnectTimers[slot] = setTimeout(() => {
+    const current = matchRooms[roomId];
+    if (!current) return;
+    const slotId = slot === 'host' ? current.host : current.opponent;
+    if (!slotId && current.status !== 'finished') {
+      current.status = 'abandoned';
+      current.matchResult = { status: 'abandoned', winnerName: slot === 'host' ? current.opponentName : current.hostName };
+      io.to(roomId).emit('matchAbandoned', {
+        roomId,
+        message: 'Opponent left the match.',
+        status: 'abandoned',
+        winnerName: current.matchResult.winnerName
+      });
+    }
+  }, MATCH_RECONNECT_GRACE_MS);
 }
 
 function evaluateExpressionValue(expression) {
@@ -205,29 +532,6 @@ function generateRoundState(level = 1) {
   };
 }
 
-function startMatchIfReady(roomId) {
-  const room = matchRooms[roomId];
-  if (!room) return;
-
-  if (!room.host || !room.opponent) return;
-  if (!room.ready[room.host] || !room.ready[room.opponent]) return;
-  if (room.status === 'playing' || room.status === 'finished') return;
-
-  room.status = 'playing';
-  room.roundState = generateRoundState(room.level || 1);
-  room.startedAt = Date.now();
-
-  io.to(roomId).emit('matchStart', {
-    roomId,
-    players: [
-      { id: room.host, name: room.hostName },
-      { id: room.opponent, name: room.opponentName }
-    ],
-    roundState: room.roundState,
-    startedAt: room.startedAt
-  });
-}
-
 // ==========================================
 // SOCKET CONNECTION
 // ==========================================
@@ -243,46 +547,47 @@ io.on('connection', (socket) => {
   // ==========================================
   socket.on('createRoom', async (data) => {
     try {
-      const { playerName } = data;
+      const { playerName } = data || {};
       let roomCode = generateRoomCode();
 
-      // Ensure unique room code
       while (matchRooms[roomCode]) {
         roomCode = generateRoomCode();
       }
 
-      // Store room in memory
       matchRooms[roomCode] = {
         roomId: roomCode,
         host: socket.id,
-        hostName: playerName,
+        hostName: playerName || 'Host',
         opponent: null,
         opponentName: null,
         status: 'waiting',
         ready: {},
         level: 1,
         roundState: null,
+        currentRound: 1,
+        matchStats: null,
+        roundResults: { 1: { host: null, opponent: null }, 2: { host: null, opponent: null } },
         winnerId: null,
         loserId: null,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        reconnectTimers: {},
+        roundTimeout: null,
+        matchId: `${roomCode}_${Date.now()}`
       };
 
-      // Store match in Supabase only if configured; otherwise keep working in-memory.
-      const matchRecordResult = await createMatchRecord(roomCode, playerName);
+      const matchRecordResult = await createMatchRecord(roomCode, playerName || 'Host');
       if (matchRecordResult.ok === false && matchRecordResult.error && !supabase) {
         console.warn('[MATCH] Supabase unavailable; continuing in-memory room creation');
       }
 
-      // Join the socket to a room
       socket.join(roomCode);
+      console.log(`[MATCH] Room created: ${roomCode} by ${playerName || 'Host'} (${socket.id})`);
 
-      console.log(`[MATCH] Room created: ${roomCode} by ${playerName} (${socket.id})`);
-
-      // Send room code to host
       socket.emit('roomCreated', {
         roomId: roomCode,
-        playerName: playerName,
-        status: 'waiting'
+        playerName: playerName || 'Host',
+        status: 'waiting',
+        matchId: matchRooms[roomCode].matchId
       });
 
     } catch (err) {
@@ -291,14 +596,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ==========================================
-  // JOIN ROOM
-  // ==========================================
   socket.on('joinRoom', async (data) => {
     try {
-      const { roomId, playerName } = data;
+      const { roomId, playerName } = data || {};
 
-      // Check if room exists
       if (!matchRooms[roomId]) {
         console.log(`[MATCH] Failed: Room ${roomId} does not exist`);
         socket.emit('joinError', 'Invalid room code');
@@ -307,22 +608,24 @@ io.on('connection', (socket) => {
 
       const room = matchRooms[roomId];
 
-      // Check if room is full
       if (room.opponent) {
         console.log(`[MATCH] Failed: Room ${roomId} is full`);
         socket.emit('joinError', 'Room is full');
         return;
       }
 
-      // Add opponent to room
       room.opponent = socket.id;
-      room.opponentName = playerName;
+      room.opponentName = playerName || 'Guest';
       room.status = 'ready';
       room.ready = {};
+      room.matchId = room.matchId || `${room.roomId}_${Date.now()}`;
+      room.matchStats = {
+        host: { ...normalizeMatchStats(), connected: true },
+        opponent: { ...normalizeMatchStats(), connected: true }
+      };
 
-      // Update Supabase only if configured; otherwise continue with in-memory room state.
       const updateResult = await updateMatchRecord(roomId, {
-        opponent_name: playerName,
+        opponent_name: room.opponentName,
         status: 'ready'
       });
 
@@ -330,23 +633,21 @@ io.on('connection', (socket) => {
         console.warn('[MATCH] Supabase unavailable; continuing in-memory room join');
       }
 
-      // Join the socket to the room
       socket.join(roomId);
+      console.log(`[MATCH] Player joined: ${roomId} | Player: ${room.opponentName} (${socket.id})`);
 
-      console.log(`[MATCH] Player joined: ${roomId} | Player: ${playerName} (${socket.id})`);
-
-      // Notify opponent that someone joined
       io.to(roomId).emit('opponentJoined', {
         roomId: roomId,
+        matchId: room.matchId,
         players: [
           { id: room.host, name: room.hostName },
           { id: room.opponent, name: room.opponentName }
         ]
       });
 
-      // Send join confirmation to joining player
       socket.emit('roomJoined', {
         roomId: roomId,
+        matchId: room.matchId,
         players: [
           { id: room.host, name: room.hostName },
           { id: room.opponent, name: room.opponentName }
@@ -359,19 +660,35 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ==========================================
-  // GAME START (READY)
-  // ==========================================
   socket.on('playerReady', (data) => {
-    const { roomId } = data;
+    const { roomId } = data || {};
     const room = matchRooms[roomId];
 
     if (!room) return;
 
     room.ready[socket.id] = true;
     console.log(`[MATCH] Player ready in ${roomId}: ${socket.id}`);
-    io.to(roomId).emit('playerReadyAck', { playerId: socket.id });
+    io.to(roomId).emit('playerReadyAck', { playerId: socket.id, roomId });
     startMatchIfReady(roomId);
+  });
+
+  socket.on('togglePause', (data) => {
+    const roomId = data?.roomId;
+    const room = matchRooms[roomId];
+    if (!room) return;
+
+    const isPaused = !!data?.isPaused;
+    room.pauseState = room.pauseState || { isPaused: false, by: null };
+    room.pauseState.isPaused = isPaused;
+    room.pauseState.by = isPaused ? socket.id : null;
+
+    io.to(roomId).emit('matchPauseState', {
+      roomId,
+      isPaused,
+      pausedBy: socket.id,
+      matchStats: room.matchStats,
+      players: buildRoomPlayers(room)
+    });
   });
 
   socket.on('leaveMatch', (data) => {
@@ -391,17 +708,20 @@ io.on('connection', (socket) => {
       room.opponent = null;
       room.opponentName = null;
     }
+
     room.ready = {};
-    room.status = room.host ? 'waiting' : 'closed';
+    room.status = room.host ? 'abandoned' : 'cancelled';
     room.winnerId = null;
     room.loserId = null;
     room.roundState = null;
+    clearRoundTimer(room);
 
     if (remainingId) {
       io.to(remainingId).emit('playerLeft', {
         roomId,
         playerId: socket.id,
-        message: 'Opponent left the room'
+        message: 'Opponent left the match.',
+        status: 'abandoned'
       });
     }
 
@@ -410,85 +730,110 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('rejoinMatch', (data) => {
+    const { roomId, playerName } = data || {};
+    const room = matchRooms[roomId];
+    if (!room) return;
+
+    const slot = room.hostName === playerName ? 'host' : (room.opponentName === playerName ? 'opponent' : null);
+    if (!slot) return;
+
+    room[slot] = socket.id;
+    room.ready[socket.id] = true;
+    room.playerReconnectGrace = null;
+    if (room.reconnectTimers) {
+      if (room.reconnectTimers[slot]) {
+        clearTimeout(room.reconnectTimers[slot]);
+        room.reconnectTimers[slot] = null;
+      }
+    }
+
+    io.to(roomId).emit('matchState', buildMatchState(room));
+    socket.emit('rejoinedMatch', { roomId, matchId: room.matchId, currentRound: room.currentRound || 1, roundState: room.roundState, matchStats: room.matchStats });
+  });
+
   socket.on('matchSubmission', (data) => {
     const { roomId, expression } = data || {};
     const room = matchRooms[roomId];
 
-    if (!room || room.status !== 'playing') return;
+    if (!room || !['round1', 'round2'].includes(room.status)) return;
+
+    const slot = getRoomPlayerSlot(room, socket.id);
+    if (!slot) return;
+
+    const roundNumber = Number(room.currentRound || 1);
+    room.roundResults = room.roundResults || { 1: { host: null, opponent: null }, 2: { host: null, opponent: null } };
+    room.roundResults[roundNumber] = room.roundResults[roundNumber] || { host: null, opponent: null };
+
+    if (room.roundResults[roundNumber][slot]) {
+      return;
+    }
 
     const value = evaluateExpressionValue(expression);
     const target = room.roundState?.target;
-    if (value === null || target === null || typeof target === 'undefined') return;
+    if (value === null || target === null || typeof target === 'undefined') {
+      room.roundResults[roundNumber][slot] = { correct: false, expression, submittedAt: Date.now(), invalid: true };
+      if (room.roundResults[roundNumber].host && room.roundResults[roundNumber].opponent) {
+        finalizeRound(roomId);
+      }
+      return;
+    }
 
-    if (value === target) {
-      room.status = 'finished';
-      room.winnerId = socket.id;
-      room.loserId = socket.id === room.host ? room.opponent : room.host;
+    const correct = value === target;
+    room.roundResults[roundNumber][slot] = { correct, expression, submittedAt: Date.now() };
 
-      io.to(roomId).emit('matchResult', {
+    if (room.roundResults[roundNumber].host && room.roundResults[roundNumber].opponent) {
+      finalizeRound(roomId);
+    } else {
+      io.to(roomId).emit('roundUpdate', {
         roomId,
-        winnerId: room.winnerId,
-        loserId: room.loserId,
-        winnerName: socket.id === room.host ? room.hostName : room.opponentName,
-        loserName: socket.id === room.host ? room.opponentName : room.hostName,
-        target,
-        expression,
-        status: 'finished'
+        currentRound: roundNumber,
+        matchStats: room.matchStats,
+        roundState: room.roundState,
+        players: buildRoomPlayers(room)
       });
     }
   });
 
-  // ==========================================
-  // GAME STATE SYNC (for multiplayer gameplay)
-  // ==========================================
   socket.on('gameStateUpdate', (data) => {
-    const { roomId, gameState } = data;
+    const { roomId, gameState } = data || {};
     const room = matchRooms[roomId];
 
     if (room) {
-      // Broadcast game state to opponent
       socket.to(roomId).emit('opponentGameState', {
         playerId: socket.id,
-        gameState: gameState
+        gameState: gameState,
+        roomId,
+        currentRound: room.currentRound,
+        matchStats: room.matchStats
       });
     }
   });
 
-  // ==========================================
-  // DISCONNECT
-  // ==========================================
   socket.on('disconnect', (reason) => {
-    console.log(
-      `Socket disconnected: ${socket.id} | Reason: ${reason}`
-    );
+    console.log(`Socket disconnected: ${socket.id} | Reason: ${reason}`);
 
-    // Find and clean up match rooms
     for (const roomId in matchRooms) {
       const room = matchRooms[roomId];
       if (room.host === socket.id || room.opponent === socket.id) {
-        console.log(`[MATCH] Cleaning up room ${roomId} due to disconnect`);
+        console.log(`[MATCH] Grace period started for ${roomId} due to disconnect`);
 
+        const slot = room.host === socket.id ? 'host' : 'opponent';
         const remainingId = room.host === socket.id ? room.opponent : room.host;
         if (remainingId) {
-          io.to(roomId).emit('playerLeft', { playerId: socket.id, roomId, message: 'Opponent left the room' });
+          io.to(remainingId).emit('opponentDisconnected', {
+            roomId,
+            playerId: socket.id,
+            message: 'Opponent disconnected. Reconnecting...',
+            status: 'reconnect_pending'
+          });
         }
 
-        if (room.host === socket.id) {
-          room.host = room.opponent || null;
-          room.hostName = room.opponentName || null;
+        if (room.matchStats) {
+          room.matchStats[slot].connected = false;
         }
-        if (room.opponent === socket.id) {
-          room.opponent = null;
-          room.opponentName = null;
-        }
-        room.ready = {};
-        room.status = room.host ? 'waiting' : 'closed';
-        room.winnerId = null;
-        room.loserId = null;
 
-        if (!room.host) {
-          delete matchRooms[roomId];
-        }
+        scheduleReconnectCheck(roomId, slot);
       }
     }
   });
@@ -607,6 +952,7 @@ app.get(['/matches', '/api/matches'], async (req, res) => {
 app.post(['/scores', '/api/scores'], async (req, res) => {
   try {
     if (!supabase) {
+      console.error('[SCORES] Supabase not configured');
       return res.status(200).json({
         success: false,
         queuedLocally: true,
@@ -617,6 +963,7 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
     const { username, score } = req.body;
 
     if (!username) {
+      console.warn('[SCORES] Missing username in payload:', req.body);
       return res.status(200).json({
         success: false,
         queuedLocally: true,
@@ -624,6 +971,7 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
       });
     }
 
+    const matchId = req.body.match_id || req.body.matchId || null;
     const payload = {
       username,
       score: Number(score) || 0,
@@ -637,26 +985,50 @@ app.post(['/scores', '/api/scores'], async (req, res) => {
       created_at: new Date().toISOString()
     };
 
-    const { data, error } = await supabase
+    if (matchId) {
+      payload.match_id = matchId;
+    }
+
+    console.log('[SCORES] Inserting score:', payload);
+
+    let { data, error } = await supabase
       .from('scores')
-      .insert([payload])
+      .upsert([
+        payload
+      ], { onConflict: 'match_id', ignoreDuplicates: false })
       .select();
 
     if (error) {
+      console.warn('[SCORES] match_id upsert unavailable or failed; retrying without match_id', error.message);
+      const fallback = { ...payload };
+      delete fallback.match_id;
+      const fallBackResult = await supabase
+        .from('scores')
+        .insert([fallback])
+        .select();
+
+      data = fallBackResult.data;
+      error = fallBackResult.error;
+    }
+
+    if (error) {
+      console.error('[SCORES] Supabase error:', error.code, error.message);
       return res.status(200).json({
         success: false,
         queuedLocally: true,
-        error: error.message
+        error: error.message,
+        code: error.code
       });
     }
 
+    console.log('[SCORES] Insert successful:', data);
     res.status(200).json({
       success: true,
       data
     });
 
   } catch (err) {
-    console.error('POST /scores error:', err);
+    console.error('[SCORES] Exception:', err.message, err.stack);
 
     res.status(200).json({
       success: false,
